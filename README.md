@@ -59,36 +59,67 @@ hook. See [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## Setup
 
-**1. Create a bot** — in Telegram, message [@BotFather](https://t.me/BotFather) → `/newbot` →
-pick a name and username → copy the token.
+**0. Prerequisite** — make sure Claude Code is installed and logged in:
+```bash
+claude auth login
+```
 
-**2. Store the token in the Keychain:**
+**1. Create a bot** — in Telegram, message [@BotFather](https://t.me/BotFather) → `/newbot` →
+pick a name and username → copy the token it gives you.
+
+**2. Store the token in the Keychain** (it never touches a file):
 ```bash
 security add-generic-password -s claude-tg-bridge -a bot -w '<YOUR_BOT_TOKEN>'
 ```
 
 **3. Install & start the daemon:**
 ```bash
-git clone <your-fork-url> claude-code-telegram-cockpit
+git clone https://github.com/mysm91/claude-code-telegram-cockpit.git
 cd claude-code-telegram-cockpit
 ./setup.sh
 ```
-`setup.sh` installs deps, builds, and registers a launchd agent that auto-starts on login.
+`setup.sh` installs dependencies, builds, and registers a launchd agent that starts now and on
+every login.
 
-**4. Pair your phone** — the first run prints a pairing code:
+**4. Pair your phone** — the first run prints a one-time pairing code:
 ```bash
 cat ~/.claude/bridge-state/pairing-code.txt
 ```
-Open your bot in Telegram, press **Start**, and send it the code. From then on the bot answers
-only you.
+Open your bot in Telegram, press **Start**, and send it that code. From then on the bot answers
+only you; everyone else is ignored.
 
-**5. (Recommended) One topic per session** — create a Telegram group (just you), enable
-**Topics**, and add your bot as an admin with *Manage Topics*. Each session then gets its own
-topic. Without a forum group it runs in a single flat chat.
+**5. (Recommended) One topic per session** — create a Telegram **group** with just yourself,
+open its settings and turn on **Topics**, then add your bot as an **admin** with the *Manage
+Topics* permission. Each session then gets its own topic (tab). Skip this and everything runs in
+one flat chat.
 
-**6. (Optional) Status bar / usage data** — add a `statusLine` entry to
-`~/.claude/settings.json` pointing at `statusline/collector.py` so the bot can read official
-usage numbers for host-run sessions. See [ARCHITECTURE.md](ARCHITECTURE.md).
+**6. Try it** — send **`/new`**, pick a folder, and start chatting. `/sessions` lists everything;
+`/help` shows all commands.
+
+**7. (Optional) Usage numbers for terminal/desktop sessions** — add a `statusLine` entry to
+`~/.claude/settings.json` so the bot can read official limit data for sessions you *didn't* start
+from the bot (merge it with any existing keys):
+```json
+{
+  "statusLine": {
+    "type": "command",
+    "command": "/absolute/path/to/claude-code-telegram-cockpit/statusline/collector.py"
+  }
+}
+```
+
+## Managing the daemon
+
+```bash
+# follow the logs
+tail -f ~/.claude/bridge-state/logs/bridge.log
+# restart after changes
+launchctl kickstart -k "gui/$(id -u)/com.claude-code-telegram-cockpit.bridge"
+# stop it
+launchctl bootout "gui/$(id -u)/com.claude-code-telegram-cockpit.bridge"
+# update to the latest
+git pull && ./setup.sh
+```
 
 ## Commands
 
@@ -132,4 +163,4 @@ session into the bot with `/sessions → Close & continue here`.
 
 ## License
 
-MIT — see [LICENSE](LICENSE). Fill in your name in the copyright line before publishing.
+MIT © 2026 Meysam Shahrashoub — see [LICENSE](LICENSE).
