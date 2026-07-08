@@ -1,0 +1,1098 @@
+// Telegram command + callback layer. Single-owner: the first middleware drops every
+// update that is not from the paired owner id (silently, logged).
+import { autoRetry } from "@grammyjs/auto-retry";
+import { Bot, Context, InlineKeyboard, InputFile } from "grammy";
+import { execFile } from "node:child_process";
+import { randomBytes } from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
+import { promisify } from "node:util";
+import { BridgeConfig, saveConfig, STATE_DIR } from "../config.js";
+import { addToGroup, desktopGroupNames, removeFromGroup } from "../core/groups.js";
+import { configDirOf, listLocalSessions, listPlans, listRoutines, sessionCwd, sessionMeta, sessionTail, sessionTasks, type LocalSession } from "../core/inventory.js";
+import { disableForeign, enableForeign, ensureForeignState, foreignState } from "../core/foreignPerms.js";
+import { startPermServer } from "../core/permServer.js";
+import { accountConnected, accountUsage, transcriptContextPct } from "../core/usage.js";
+import type { SessionRec, Store } from "../state.js";
+import { Cockpit } from "./cockpit.js";
+import { esc, fmtAgo, fmtPct, fmtReset, fmtTokens, mdToHtml } from "./render.js";
+
+const execFileP = promisify(execFile);
+// Same naming as Claude Code's own mode menu ("default" is what the desktop calls "Ask permissions").
+const MODES: Array<{ id: string; label: string; hint: string }> = [
+  { id: "default", label: "Ask permissions", hint: "asks before sensitive actions — Claude Code's standard default" },
+  { id: "acceptEdits", label: "Accept edits", hint: "file edits auto-approved; other actions still ask" },
+  { id: "plan", label: "Plan mode", hint: "read-only research, then a plan you approve" },
+  { id: "auto", label: "Auto mode", hint: "a safety classifier auto-approves safe actions, asks otherwise" },
+  { id: "dontAsk", label: "Don't ask", hint: "never prompts — actions that would ask are denied" },
+  { id: "bypassPermissions", label: "Bypass permissions", hint: "everything allowed, no prompts — use with care" },
+];
+const modeLabel = (id: string): string => MODES.find((m) => m.id === id)?.label ?? id;
+// Desktop slider order, smartest first: Ultracode > Max > Extra > High > Medium > Low.
+const EFFORTS: Array<{ id: string; label: string; hint: string }> = [
+  { id: "ultracode", label: "Ultracode", hint: "Extra effort + standing multi-agent workflow orchestration — most thorough, token-hungry" },
+  { id: "max", label: "Max", hint: "maximum reasoning effort (switches via a quick respawn+resume)" },
+  { id: "xhigh", label: "Extra", hint: "extra-high effort — your global default" },
+  { id: "high", label: "High", hint: "strong reasoning for normal work" },
+  { id: "medium", label: "Medium", hint: "balanced speed and depth" },
+  { id: "low", label: "Low", hint: "fastest and lightest" },
+];
+const effortLabel = (id?: string): string => (id ? EFFORTS.find((e) => e.id === id)?.label ?? id : "Extra (global default)");
+const modelVersion = (m: { id: string; label: string; description: string }): string =>
+  m.id === "default" ? m.label : (m.description.split("·")[0]?.trim() || m.label).replace(" with 1M context", " (1M)");
+const SESSIONS_PER_PAGE = 10;
+const shortPath = (p: string): string => p.replace(/^\/Users\//, "");
+
+type Awaiting =
+  | { type: "dir" }
+  | { type: "planFeedback"; aid: string }
+  | { type: "questionOther"; aid: string };
+
+export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot: Bot; cockpit: Cockpit } {
+  const bot = new Bot(token);
+  bot.api.config.use(autoRetry());
+  // Bulletproof every HTML send: if Telegram rejects the entities (a stray unescaped
+  // <…> in some title/path/output), transparently resend as plain text instead of
+  // failing the whole update. Covers all present + future code paths.
+  bot.api.config.use(async (prev, method, payload, signal) => {
+    const res = await prev(method, payload, signal);
+    const p = payload as { parse_mode?: string; text?: string; caption?: string };
+    if (!res.ok && (res as { error_code?: number }).error_code === 400 &&
+        /can't parse entities/i.test((res as { description?: string }).description ?? "") &&
+        p.parse_mode && (method === "sendMessage" || method === "editMessageText")) {
+      const stripped = { ...payload, parse_mode: undefined } as typeof payload & { text?: string };
+      if (typeof p.text === "string") stripped.text = p.text.replace(/<[^>]+>/g, "");
+      return prev(method, stripped, signal);
+    }
+    return res;
+  });
+  // Never let one failed handler silence the bot (that was the "nothing happens" bug).
+  bot.catch((err) => {
+    console.error("bot.catch:", err.error instanceof Error ? err.error.message : err.error);
+  });
+  const cockpit = new Cockpit(bot.api, cfg, store);
+
+  const pairingCode = cfg.ownerId ? null : randomBytes(3).toString("hex");
+  if (pairingCode) {
+    const msg = `claude-tg-bridge pairing code: ${pairingCode}  (send it to the bot in Telegram)`;
+    console.log(`\n=== ${msg} ===\n`);
+    fs.writeFileSync(path.join(STATE_DIR, "pairing-code.txt"), pairingCode + "\n");
+  }
+
+  let activeKey: string | null = null; // flat-mode active session
+  const awaiting = new Map<string, Awaiting>(); // threadKey -> pending input
+  let lastList: LocalSession[] = [];
+
+  const threadKey = (ctx: Context): string => `${ctx.chat?.id}:${(ctx.message ?? ctx.callbackQuery?.message)?.message_thread_id ?? 0}`;
+
+  const recOf = (ctx: Context): SessionRec | undefined => {
+    const tid = (ctx.message ?? ctx.callbackQuery?.message)?.message_thread_id;
+    if (cfg.forumMode && tid) return store.byTopic(tid);
+    if (activeKey) return store.sessions.get(activeKey);
+    return undefined;
+  };
+
+  // ---- middleware: pairing + allowlist ----
+  bot.use(async (ctx, next) => {
+    const uid = ctx.from?.id;
+    if (!cfg.ownerId) {
+      if (ctx.message?.text?.trim() === pairingCode && uid) {
+        cfg.ownerId = uid;
+        cfg.chatId = ctx.chat?.id;
+        saveConfig(cfg);
+        await ctx.reply("🔗 Paired. This bot now answers only to you.\nUse /help to see what it can do, /new to start a session.");
+        return;
+      }
+      return; // unpaired: ignore everything else
+    }
+    if (uid !== cfg.ownerId) {
+      console.log(`dropped update from non-owner ${uid}`);
+      return;
+    }
+    if (!cfg.chatId && ctx.chat) { cfg.chatId = ctx.chat.id; saveConfig(cfg); }
+    await next();
+  });
+
+  // ---- helpers ----
+  async function startSession(cwd: string, firstPrompt?: string, opts: Partial<SessionRec> = {}): Promise<SessionRec | null> {
+    if (!fs.existsSync(cwd)) return null;
+    const rec: SessionRec = {
+      key: store.newKey(),
+      cwd,
+      account: cfg.activeAccount,
+      mode: opts.mode ?? cfg.defaults.mode,
+      model: opts.model ?? cfg.defaults.model,
+      effort: opts.effort ?? cfg.defaults.effort,
+      status: "running",
+      kind: "managed",
+      title: undefined,
+      createdAt: Date.now(),
+      lastActivityAt: Date.now(),
+      ...opts,
+    };
+    rec.title = opts.title ?? cockpit.titleFor(cwd);
+    rec.topicId = await cockpit.makeTopic(`🤖 ${rec.title}`);
+    activeKey = rec.key;
+    await cockpit.spawn(rec, { firstPrompt, resume: opts.sessionId });
+    await cockpit.say(rec, `🚀 <b>${esc(rec.title ?? cwd)}</b>\n<code>${esc(cwd)}</code>\naccount <b>${esc(rec.account)}</b> · mode <b>${rec.mode}</b>${rec.model ? ` · model <b>${esc(rec.model)}</b>` : ""}${rec.effort ? ` · effort <b>${rec.effort}</b>` : ""}\n${firstPrompt ? "" : "Type your first message."}`);
+    return rec;
+  }
+
+  let newDirs: string[] = []; // cache backing the /new directory buttons (index must match the picker)
+  let newDirsPage = 0;
+  const DIRS_PER_PAGE = 10;
+
+  // Every project folder that has a session anywhere on the Mac (all accounts),
+  // most-recently-used first. Uses each session's REAL cwd (from the transcript) and
+  // verifies the folder still exists — so no lossy-decoded or dead paths get offered.
+  async function projectDirs(): Promise<string[]> {
+    const seen = new Set<string>();
+    const ordered: string[] = [];
+    const add = (d?: string | null): void => {
+      if (d && !seen.has(d) && fs.existsSync(d)) { seen.add(d); ordered.push(d); }
+    };
+    for (const s of [...store.sessions.values()].sort((a, b) => b.lastActivityAt - a.lastActivityAt)) add(s.cwd);
+    try {
+      const { sessions } = await listLocalSessions(cfg.accounts, 300); // sorted live-first, then newest
+      for (const s of sessions) add(sessionCwd(s.file)); // real cwd only — never the lossy folder-name guess
+    } catch { /* fall back to bridge dirs only */ }
+    add(process.env.HOME); // home dir as a sensible default entry
+    return ordered;
+  }
+
+  const newDirsKb = (page: number): InlineKeyboard => {
+    const kb = new InlineKeyboard();
+    const start = page * DIRS_PER_PAGE;
+    newDirs.slice(start, start + DIRS_PER_PAGE).forEach((d, i) => {
+      const label = shortPath(d);
+      kb.text(label.length > 42 ? "…" + label.slice(-40) : label, `dir:${start + i}`).row();
+    });
+    const pages = Math.max(1, Math.ceil(newDirs.length / DIRS_PER_PAGE));
+    if (pages > 1) {
+      if (page > 0) kb.text("« Prev", `np:${page - 1}`);
+      kb.text(`page ${page + 1}/${pages}`, "noop");
+      if (page < pages - 1) kb.text("Next »", `np:${page + 1}`);
+    }
+    return kb;
+  };
+
+  const usageBar = (pct?: number): string => {
+    if (pct === undefined) return "▫️ n/a";
+    const filled = Math.round(Math.min(100, pct) / 10);
+    return `${"▓".repeat(filled)}${"░".repeat(10 - filled)} ${Math.round(pct)}%`;
+  };
+
+  // ---- commands ----
+  bot.command("start", async (ctx) => {
+    cfg.chatId = ctx.chat.id;
+    if (ctx.chat.type === "supergroup" && (ctx.chat as { is_forum?: boolean }).is_forum) cfg.forumMode = true;
+    saveConfig(cfg);
+    await ctx.reply("👋 Cockpit online. /new to start a session, /sessions to browse, /help for everything.");
+  });
+
+  bot.command("help", (ctx) =>
+    ctx.reply(
+      [
+        "<b>Sessions</b>: /new [path] · /sessions · /resume &lt;id&gt; · /use (flat mode) · /stop · /kill",
+        "<b>While in a session topic</b>: just type to send input · /model · /mode · /effort · /status · /copy · /plan · /tasks · /files · /file &lt;path&gt;",
+        "<b>Watch foreign sessions</b>: /sessions → 👁 Watch · /unwatch",
+        "<b>Overview</b>: /usage · /routines · /plans · /groups · /group &lt;name&gt; · /ungroup &lt;name&gt; · /account",
+        "<b>Permissions & plans</b> arrive as button prompts automatically.",
+      ].join("\n"),
+      { parse_mode: "HTML" },
+    ),
+  );
+
+  bot.command("new", async (ctx) => {
+    const arg = ctx.match?.trim();
+    if (arg) {
+      const [dir, ...rest] = arg.split(/\s+/);
+      const abs = dir.startsWith("~") ? dir.replace("~", process.env.HOME ?? "") : dir;
+      const created = await startSession(path.resolve(abs), rest.join(" ") || undefined);
+      if (!created) await ctx.reply(`Directory not found: ${abs}`);
+      return;
+    }
+    newDirs = await projectDirs();
+    newDirsPage = 0;
+    awaiting.set(threadKey(ctx), { type: "dir" });
+    await ctx.reply(
+      `Where should the session run? Tap a project folder (${newDirs.length} with local sessions) or type an absolute path:`,
+      { parse_mode: "HTML", reply_markup: newDirsKb(0) },
+    );
+  });
+
+  // Two-level session browser: a list of PROJECTS (folders) → the sessions inside one.
+  // Scales cleanly to 100+ sessions in ONE message that edits in place (no wall of pages).
+  const PROJECTS_PER_PAGE = 10;
+  interface Project { folder: string; idxs: number[]; recent: number; live: boolean }
+  let projects: Project[] = [];
+  let projectsPage = 0;
+  let curProject = -1;
+  let projSessPage = 0;
+
+  const buildProjects = (): void => {
+    for (const s of lastList) {
+      if (!s.realCwd) s.realCwd = s.cwd;
+      // Sidecars usually carry a real title; for the rare untitled one, derive from first prompt.
+      if (!s.title && s.file) { const m = sessionMeta(s.file); if (m.firstPrompt) s.title = m.firstPrompt; }
+    }
+    const by = new Map<string, number[]>();
+    lastList.forEach((s, i) => {
+      let arr = by.get(s.realCwd!);
+      if (!arr) { arr = []; by.set(s.realCwd!, arr); }
+      arr.push(i);
+    });
+    projects = [...by.entries()]
+      .map(([folder, idxs]) => ({
+        folder, idxs,
+        recent: Math.max(...idxs.map((i) => lastList[i].mtime)),
+        live: idxs.some((i) => lastList[i].live),
+      }))
+      .sort((a, b) => b.recent - a.recent); // folders by most-recent activity
+  };
+
+  let sessionsTotal = 0;
+  const projectsText = (): string => {
+    const active = lastList.filter((s) => !s.archived).length;
+    const archived = lastList.length - active;
+    const shown = sessionsTotal > lastList.length ? `showing ${lastList.length} most-recent of ${sessionsTotal}` : `${lastList.length}`;
+    return `<b>Projects</b> — ${shown} sessions across ${projects.length} folders\n` +
+      `<i>${active} active${archived ? ` · ${archived} archived 🗄` : ""} · 🟢 = live now. Tap a project.</i>`;
+  };
+
+  const projectsKb = (page: number): InlineKeyboard => {
+    const kb = new InlineKeyboard();
+    const start = page * PROJECTS_PER_PAGE;
+    projects.slice(start, start + PROJECTS_PER_PAGE).forEach((p, i) => {
+      kb.text(`${p.live ? "🟢" : "📁"} ${path.basename(p.folder)} · ${p.idxs.length} · ${fmtAgo(p.recent)}`, `proj:${start + i}`).row();
+    });
+    const pages = Math.max(1, Math.ceil(projects.length / PROJECTS_PER_PAGE));
+    if (pages > 1) {
+      if (page > 0) kb.text("« Prev", `pp:${page - 1}`);
+      kb.text(`page ${page + 1}/${pages}`, "noop");
+      if (page < pages - 1) kb.text("Next »", `pp:${page + 1}`);
+    }
+    return kb;
+  };
+
+  const projSessText = (pi: number): string => {
+    const p = projects[pi];
+    return `<b>${esc(path.basename(p.folder))}</b> — ${p.idxs.length} session${p.idxs.length > 1 ? "s" : ""}\n` +
+      `<code>${esc(shortPath(p.folder))}</code>\n<i>🟢 running now · ⚪️ resumable · newest first. Tap one to act.</i>`;
+  };
+
+  const projSessKb = (pi: number, page: number): InlineKeyboard => {
+    const kb = new InlineKeyboard();
+    const p = projects[pi];
+    const start = page * SESSIONS_PER_PAGE;
+    p.idxs.slice(start, start + SESSIONS_PER_PAGE).forEach((gi) => {
+      const s = lastList[gi];
+      const name = s.title ?? path.basename(s.realCwd!);
+      const mark = s.live ? "🟢" : s.archived ? "🗄" : "⚪️";
+      kb.text(`${mark} ${name.slice(0, 28)} · ${fmtAgo(s.mtime)}`, `sl:${gi}:m`).row();
+    });
+    const pages = Math.max(1, Math.ceil(p.idxs.length / SESSIONS_PER_PAGE));
+    if (pages > 1) {
+      if (page > 0) kb.text("« Prev", `ps:${pi}:${page - 1}`);
+      kb.text(`page ${page + 1}/${pages}`, "noop");
+      if (page < pages - 1) kb.text("Next »", `ps:${pi}:${page + 1}`);
+    }
+    kb.text("« All projects", "projs");
+    return kb;
+  };
+
+  bot.command("sessions", async (ctx) => {
+    const res = await listLocalSessions(cfg.accounts, 300);
+    lastList = res.sessions;
+    sessionsTotal = res.total;
+    if (!lastList.length) return void ctx.reply("No local sessions found.");
+    // listLocalSessions already sorts live → active → archived, each newest-first; keep that
+    // order so within a project the live/active ones sit above archived (don't re-sort here).
+    buildProjects();
+    projectsPage = 0; curProject = -1; projSessPage = 0;
+    await cockpit.say(null, projectsText(), projectsKb(0));
+  });
+
+  bot.command("resume", async (ctx) => {
+    const id = ctx.match?.trim();
+    if (!id) return void ctx.reply("Usage: /resume <session-id or list number>");
+    const byNum = /^\d{1,2}$/.test(id) ? lastList[Number(id) - 1] : lastList.find((s) => s.sessionId.startsWith(id));
+    if (!byNum) return void ctx.reply("Session not found — run /sessions first or give a session id.");
+    await resumeLocal(byNum, false);
+  });
+
+  // Mirror the last exchange (their last turn + Claude's last reply) so you can see where
+  // a resumed session left off before continuing it.
+  async function postTail(rec: SessionRec, file: string): Promise<void> {
+    const tail = sessionTail(file);
+    if (!tail.lastUser && !tail.lastAssistant) return;
+    const parts = ["📖 <b>Where it left off</b>"];
+    if (tail.lastUser) parts.push(`👤 <i>${esc(tail.lastUser)}</i>`);
+    if (tail.lastAssistant) parts.push(mdToHtml(tail.lastAssistant));
+    await cockpit.say(rec, parts.join("\n\n"));
+  }
+
+  // A session the bridge itself already runs (has a topic here), if any.
+  const bridgeManaged = (sessionId: string): SessionRec | undefined =>
+    [...store.sessions.values()].find((r) => r.kind === "managed" && r.sessionId === sessionId && r.status !== "closed");
+
+  async function resumeLocal(s: LocalSession, fork: boolean): Promise<void> {
+    if (!fork) {
+      // If this is one of OUR sessions, it already has a topic — reuse it (it being "live"
+      // just means our own process; never treat it as a foreign session to close).
+      const existing = bridgeManaged(s.sessionId);
+      if (existing) {
+        activeKey = existing.key;
+        if (cockpit.live.get(existing.key)) {
+          await cockpit.say(existing, "▶️ This is already open in its own topic here — go there and type.");
+          return;
+        }
+        await cockpit.spawn(existing, { resume: s.sessionId });
+        await cockpit.say(existing, "▶️ Resumed in its existing topic — type to continue.");
+        await postTail(existing, s.file);
+        return;
+      }
+    }
+    // Not ours, and live on the Mac → can't resume without interleaving; caller offers Close/Fork.
+    if (s.live && !fork) {
+      await cockpit.say(null, "That session is live on the Mac — resuming here would interleave two writers. Use <b>Close on Mac & continue</b> or <b>Fork</b>.");
+      return;
+    }
+    const cwd = sessionCwd(s.file) ?? s.cwd;
+    const name = s.title ?? s.sessionId.slice(0, 8);
+    // The session's original folder must exist to resume (that's where its transcript lives).
+    // If it was deleted/renamed since, offer to recreate it — history is in the transcript, not the folder.
+    if (!fs.existsSync(cwd)) {
+      const kb = new InlineKeyboard()
+        .text("📁 Recreate folder & resume", `mk:${lastList.indexOf(s)}:${Number(fork)}`).row()
+        .text("Cancel", "sl:back");
+      await cockpit.say(null,
+        `⚠️ This session's folder no longer exists:\n<code>${esc(cwd)}</code>\n` +
+        "It was moved or deleted since the session ran. I can recreate the (empty) folder and resume — the full conversation is preserved in the transcript; only the old files in that folder are gone.",
+        kb);
+      return;
+    }
+    const rec = await startSession(cwd, undefined, {
+      sessionId: s.sessionId,
+      account: s.account,
+      title: `${name} · ${path.basename(cwd)}`.slice(0, 96),
+    } as Partial<SessionRec>);
+    if (rec) {
+      await cockpit.say(rec, fork ? "🔀 Forked from the live session — this is a separate branch." : "▶️ Resumed. Type to continue the conversation.");
+      await postTail(rec, s.file);
+    } else await cockpit.say(null, `⚠️ Couldn't start the session in <code>${esc(cwd)}</code>. Try /new instead.`);
+  }
+
+  // ---- Away-mode foreign-session permission relay (opt-in; default off) ----
+  ensureForeignState();
+  const foreignAlways = new Set<string>(); // `${cwd}::${tool}` the owner said "always allow" to
+  let pendingForeignRevise: string | null = null; // foreignApprovals id awaiting revision feedback
+  startPermServer(foreignState().port, foreignState().token, async (req) => {
+    if (bridgeManaged(req.sessionId)) return { decision: "ask" as const }; // our own session — canUseTool handles it
+    if (foreignAlways.has(`${req.cwd}::${req.tool}`)) return { decision: "allow" as const };
+    return cockpit.askForeign(randomBytes(4).toString("hex"), req.tool, req.cwd, req.input, foreignState().waitSeconds * 1000);
+  });
+
+  bot.command("foreign", async (ctx) => {
+    const arg = ctx.match?.trim().toLowerCase();
+    const st = foreignState();
+    if (arg?.startsWith("on")) {
+      const mins = Number(arg.split(/\s+/)[1]);
+      const idle = Number.isFinite(mins) && mins > 0 ? Math.round(mins * 60) : st.idleSeconds;
+      const s = enableForeign(idle);
+      const thresh = s.idleSeconds < 60 ? `${s.idleSeconds}s` : `${Math.round(s.idleSeconds / 60)} min`;
+      return void ctx.reply(
+        `✅ Away-mode <b>ON</b>. When you've been away from the Mac for <b>${thresh}</b>, permission prompts from desktop/terminal sessions come here with Allow/Deny. No answer in ~2 min → the prompt waits on the Mac. <code>/foreign off</code> to stop.`,
+        { parse_mode: "HTML" });
+    }
+    if (arg === "off") { disableForeign(); return void ctx.reply("🚫 Away-mode OFF. The global hook is removed — zero effect on your desktop sessions."); }
+    await ctx.reply(
+      `<b>Away-mode</b>: ${st.enabled ? "🟢 ON" : "⚪️ off"}\nIdle threshold: <b>${Math.round(st.idleSeconds / 60)} min</b>\n\n` +
+      "Forwards permission prompts from sessions you started <i>outside</i> Telegram (desktop app / terminal) to your phone — but only while you're away from the Mac, and only for approval-worthy tools. Fails safe to the normal desktop prompt.\n\n" +
+      "<code>/foreign on</code> · <code>/foreign on 5</code> (idle minutes) · <code>/foreign off</code>",
+      { parse_mode: "HTML" });
+  });
+
+  bot.command("use", async (ctx) => {
+    const open = [...store.sessions.values()].filter((s) => s.kind === "managed" && s.status !== "closed");
+    if (!open.length) return void ctx.reply("No open sessions. /new to start one.");
+    const kb = new InlineKeyboard();
+    open.slice(0, 10).forEach((s) => kb.text(`${s.status === "running" ? "🟢" : "💤"} ${s.title ?? s.cwd}`, `use:${s.key}`).row());
+    await ctx.reply("Active session for this chat:", { reply_markup: kb });
+  });
+
+  bot.command("stop", async (ctx) => {
+    const rec = recOf(ctx);
+    const sess = rec && cockpit.live.get(rec.key);
+    if (!sess) return void ctx.reply("No live managed session here.");
+    await sess.interrupt();
+    await ctx.reply("⏹ Interrupted.");
+  });
+
+  bot.command("kill", async (ctx) => {
+    const rec = recOf(ctx);
+    const sess = rec && cockpit.live.get(rec.key);
+    if (!sess) return void ctx.reply("No live managed session here.");
+    sess.kill();
+    store.flushSessions();
+    await ctx.reply("💀 Killed.");
+  });
+
+  bot.command("mode", async (ctx) => {
+    const rec = recOf(ctx);
+    if (!rec) return void ctx.reply("No session here.");
+    const kb = new InlineKeyboard();
+    MODES.forEach((m) => kb.text(m.id === rec.mode ? `✓ ${m.label}` : m.label, `mo:${m.id}`).row());
+    const hints = MODES.map((m) => `${m.id === rec.mode ? "✓" : "·"} <b>${m.label}</b> — <i>${m.hint}</i>`).join("\n");
+    await ctx.reply(`<b>Permission mode</b> — current: <b>${modeLabel(rec.mode)}</b>\n\n${hints}`, { parse_mode: "HTML", reply_markup: kb });
+  });
+
+  bot.command("effort", async (ctx) => {
+    const rec = recOf(ctx);
+    if (!rec) return void ctx.reply("No session here.");
+    const kb = new InlineKeyboard();
+    EFFORTS.forEach((e) => kb.text(e.id === rec.effort ? `✓ ${e.label}` : e.label, `ef:${e.id}`).row());
+    const hints = EFFORTS.map((e) => `${e.id === rec.effort ? "✓" : "·"} <b>${e.label}</b> — <i>${e.hint}</i>`).join("\n");
+    await ctx.reply(`<b>Effort</b> (Smarter → Faster) — current: <b>${effortLabel(rec.effort)}</b>\n\n${hints}`, { parse_mode: "HTML", reply_markup: kb });
+  });
+
+  bot.command("model", async (ctx) => {
+    const rec = recOf(ctx);
+    if (!rec) return void ctx.reply("No session here.");
+    const sess = cockpit.live.get(rec.key);
+    let models = sess ? await sess.models() : [];
+    if (models.length) cachedModels = models;
+    else models = cachedModels;
+    if (!models.length) return void ctx.reply("Model list not loaded yet — send one message to any session first, then retry.");
+    const isCurrent = (m: { id: string; resolved?: string }): boolean =>
+      m.id === rec.model || (!!m.resolved && m.resolved === rec.model);
+    const kb = new InlineKeyboard();
+    models.slice(0, 12).forEach((m, i) => {
+      kb.text(`${isCurrent(m) ? "✓ " : ""}${modelVersion(m)}`, `md:${rec.key}:${i}`).row();
+    });
+    modelChoices.set(rec.key, models);
+    const lines = models.map((m) => `${isCurrent(m) ? "✓" : "·"} <b>${esc(m.label)}</b> — <i>${esc(m.description || m.resolved || "")}</i>`);
+    await ctx.reply(`<b>Model</b> — current: <b>${esc(rec.model ?? "Default")}</b>\n\n${lines.join("\n")}`, { parse_mode: "HTML", reply_markup: kb });
+  });
+  const modelChoices = new Map<string, Array<{ id: string; label: string; description: string; resolved?: string }>>();
+  let cachedModels: Array<{ id: string; label: string; description: string; resolved?: string }> = [];
+
+  // Full details panel — works in any topic (managed, detached, or watch sessions).
+  const infoPanel = async (ctx: Context): Promise<void> => {
+    const rec = recOf(ctx);
+    if (!rec) return void ctx.reply("No session bound here. /sessions to pick one, /new to start.");
+    const sess = cockpit.live.get(rec.key);
+    const acct = cockpit.account(rec.account);
+    const enc = rec.cwd.replace(/[^a-zA-Z0-9]/g, "-");
+    const projDir = path.join(configDirOf(acct), "projects", enc);
+
+    const dot = rec.status === "running" ? "🟢" : rec.status === "watching" ? "👁" : rec.status === "idle" ? "🟡" : "⚪️";
+    const lines: string[] = [
+      `📟 <b>${esc(rec.title ?? path.basename(rec.cwd))}</b>`,
+      `<i>${dot} ${rec.status} · ${rec.kind} · started ${fmtAgo(rec.createdAt)} · last activity ${fmtAgo(rec.lastActivityAt)}</i>`,
+    ];
+    const pend = [...cockpit.approvals.values()].filter((a) => a.sessionKey === rec.key).length;
+    if (pend) lines.push(`⚠️ <b>${pend} pending permission prompt${pend > 1 ? "s" : ""}</b> — scroll up to answer`);
+    const taskLines = rec.sessionId ? sessionTasks(rec.sessionId, projDir) : [];
+    if (taskLines.length) lines.push(`⚙️ ${taskLines.length} background item${taskLines.length > 1 ? "s" : ""} (/tasks)`);
+    if (sess?.lastPlan) lines.push("📋 plan available (/plan)");
+
+    lines.push("", "<b>Usage</b>");
+    let tModel: string | undefined;
+    let ctxLine = "▫️ context n/a";
+    if (sess) {
+      const u = await sess.contextUsage();
+      if (u) ctxLine = `${usageBar(u.percentage)} context · ${fmtTokens(u.totalTokens)}/${fmtTokens(u.maxTokens)}`;
+    } else if (rec.sessionId) {
+      const t = transcriptContextPct(path.join(projDir, `${rec.sessionId}.jsonl`));
+      if (t) { ctxLine = `${usageBar(t.pct)} context <i>(from transcript)</i>`; tModel = t.model; }
+    }
+    lines.push(ctxLine);
+    const u = await accountUsage(acct);
+    const wline = (w: { pct?: number; resetsAt?: number; source: string; at: number } | undefined, name: string): string | null =>
+      w?.pct === undefined
+        ? null
+        : `${usageBar(w.pct)} ${name}${w.resetsAt ? ` · ${fmtReset(w.resetsAt)}` : ""} <i>(${w.source}, ${fmtAgo(w.at)})</i>`;
+    const fiveLine = wline(u.fiveHour, "5-hour");
+    const weekLine = wline(u.sevenDay, "weekly");
+    if (fiveLine) lines.push(fiveLine);
+    if (weekLine) lines.push(weekLine);
+    if (!fiveLine && !weekLine) lines.push("▫️ limits n/a — run a turn on this account first");
+
+    lines.push("", "<b>Setup</b>");
+    lines.push(`model <code>${esc(rec.model ?? tModel ?? "default")}</code>`);
+    lines.push(`mode <b>${modeLabel(rec.mode)}</b> · effort <b>${effortLabel(rec.effort)}</b>`);
+    let acctLine = `account <b>${esc(acct.name)}</b>`;
+    if (sess) {
+      const who = await sess.loggedInAs();
+      if (who?.email && who.email !== acct.name) acctLine += ` · ${esc(who.email)}`;
+      if (who?.subscriptionType) acctLine += ` (${esc(who.subscriptionType)})`;
+    }
+    lines.push(acctLine);
+
+    lines.push("", "<b>Session</b>");
+    lines.push(`<code>${esc(rec.cwd)}</code>`);
+    lines.push(rec.sessionId ? `<code>${esc(rec.sessionId)}</code>` : "<i>session id pending first reply</i>");
+    await ctx.reply(lines.join("\n"), { parse_mode: "HTML" });
+  };
+  bot.command("info", infoPanel);
+  bot.command("status", infoPanel);
+
+  bot.command("usage", async (ctx) => {
+    // Dynamic list: only accounts actually logged in right now. Log one in later and it
+    // appears here; log one out / remove it and it drops off — no static roster.
+    const connected = cfg.accounts.filter(accountConnected);
+    const dormant = cfg.accounts.filter((a) => !accountConnected(a));
+    const lines: string[] = ["<b>Usage by account</b>"];
+    for (const a of connected) {
+      const u = await accountUsage(a);
+      lines.push(`\n<b>${esc(a.name)}</b>${a.name === cfg.activeAccount ? " (active)" : ""}`);
+      if (u.fiveHour) lines.push(`5h  ${usageBar(u.fiveHour.pct)} ${fmtReset(u.fiveHour.resetsAt)} <i>(${u.fiveHour.source}, ${fmtAgo(u.fiveHour.at)})</i>`);
+      if (u.sevenDay) lines.push(`week ${usageBar(u.sevenDay.pct)} ${fmtReset(u.sevenDay.resetsAt)} <i>(${u.sevenDay.source}, ${fmtAgo(u.sevenDay.at)})</i>`);
+      if (!u.fiveHour && !u.sevenDay)
+        lines.push("<i>logged in, but no reading yet — its token is idle. Use it once (/new here, or move a session to it) and it'll show.</i>");
+    }
+    if (!connected.length) lines.push("\n<i>No accounts connected. Log one in on the Mac (see /account).</i>");
+    if (dormant.length) lines.push(`\n<i>Not connected: ${dormant.map((a) => esc(a.name)).join(", ")} — run its login on the Mac to include it.</i>`);
+    await ctx.reply(lines.join("\n"), { parse_mode: "HTML" });
+  });
+
+  bot.command("routines", async (ctx) => {
+    const rs = listRoutines();
+    if (!rs.length) return void ctx.reply("No local scheduled tasks found.");
+    const lines = rs.map((r) =>
+      `${r.enabled === false ? "⏸" : "⏰"} <b>${esc(r.name)}</b>\n      <i>${esc(r.schedule ?? "?")}${r.lastRunAt ? ` · last ${esc(String(r.lastRunAt).slice(0, 16))}` : ""}${r.cwd ? ` · ${esc(path.basename(r.cwd))}` : ""}</i>`,
+    );
+    await cockpit.say(null, `<b>Local routines</b> (run via the desktop app)\n\n${lines.join("\n")}`);
+  });
+
+  bot.command("plans", async (ctx) => {
+    const ps = listPlans();
+    if (!ps.length) return void ctx.reply("No plan files.");
+    const kb = new InlineKeyboard();
+    ps.forEach((p, i) => kb.text(p.name.slice(0, 50), `pf:${i}`).row());
+    planFiles = ps.map((p) => p.file);
+    await ctx.reply("Recent plan files (tap to receive as file):", { reply_markup: kb });
+  });
+  let planFiles: string[] = [];
+
+  bot.command("plan", async (ctx) => {
+    const rec = recOf(ctx);
+    const sess = rec && cockpit.live.get(rec.key);
+    if (sess?.lastPlan) return void cockpit.say(rec!, `📋 <b>Current plan</b>\n\n${esc(sess.lastPlan).slice(0, 12000)}`);
+    await ctx.reply("No plan in this session. /plans lists saved plan files.");
+  });
+
+  bot.command("tasks", async (ctx) => {
+    const rec = recOf(ctx);
+    if (!rec?.sessionId) return void ctx.reply("No session here (or it has no id yet).");
+    const acct = cockpit.account(rec.account);
+    const enc = rec.cwd.replace(/[^a-zA-Z0-9]/g, "-");
+    const lines = sessionTasks(rec.sessionId, path.join(configDirOf(acct), "projects", enc));
+    await ctx.reply(lines.length ? lines.map(esc).join("\n") : "No background tasks / todos for this session.", { parse_mode: "HTML" });
+  });
+
+  bot.command("files", async (ctx) => {
+    const rec = recOf(ctx);
+    if (!rec) return void ctx.reply("No session here.");
+    try {
+      const { stdout: status } = await execFileP("git", ["-C", rec.cwd, "status", "--short"], { timeout: 10_000 });
+      const { stdout: diff } = await execFileP("git", ["-C", rec.cwd, "diff", "--stat"], { timeout: 10_000 });
+      const body = `${status || "(clean)"}\n\n${diff}`.trim();
+      await cockpit.say(rec, `📁 <b>git status</b> in <code>${esc(rec.cwd)}</code>\n<pre><code>${esc(body.slice(0, 3500))}</code></pre>`);
+    } catch {
+      await ctx.reply("Not a git repo (or git failed). Use /file <path> to fetch a specific file.");
+    }
+  });
+
+  bot.command("file", async (ctx) => {
+    const rec = recOf(ctx);
+    const arg = ctx.match?.trim();
+    if (!arg) return void ctx.reply("Usage: /file <path> (relative to the session cwd or absolute)");
+    const p = path.isAbsolute(arg) ? arg : path.join(rec?.cwd ?? process.cwd(), arg);
+    try {
+      await ctx.replyWithDocument(new InputFile(p), rec?.topicId ? { message_thread_id: rec.topicId } : {});
+    } catch (e) {
+      await ctx.reply(`Couldn't send: ${e instanceof Error ? e.message : e}`);
+    }
+  });
+
+  bot.command("copy", async (ctx) => {
+    const rec = recOf(ctx);
+    const sess = rec && cockpit.live.get(rec.key);
+    if (!sess?.lastFinalText) return void ctx.reply("No output to copy yet.");
+    for (const piece of sess.lastFinalText.match(/[\s\S]{1,3500}/g) ?? []) {
+      await cockpit.say(rec!, `<pre><code>${esc(piece)}</code></pre>`);
+    }
+  });
+
+  bot.command("groups", async (ctx) => {
+    const lines: string[] = ["<b>Bridge groups</b> (managed here)"];
+    const entries = Object.entries(store.groups);
+    if (!entries.length) lines.push("<i>none — /group &lt;name&gt; adds the current session to a group</i>");
+    for (const [name, g] of entries) {
+      const members = g.sessions.map((k) => store.sessions.get(k)?.title ?? k).join(", ");
+      lines.push(`📁 <b>${esc(name)}</b>: ${esc(members || "(empty)")}`);
+    }
+    const desktop = desktopGroupNames();
+    if (desktop.length) lines.push(`\n<b>Desktop groups</b> <i>(read-only, from last sync snapshot — approximate)</i>\n${desktop.map((n) => `· ${esc(n)}`).join("\n")}`);
+    await ctx.reply(lines.join("\n"), { parse_mode: "HTML" });
+  });
+
+  bot.command("group", async (ctx) => {
+    const rec = recOf(ctx);
+    const name = ctx.match?.trim();
+    if (!rec || !name) return void ctx.reply("Usage (inside a session topic): /group <name>");
+    addToGroup(store, name, rec.key);
+    await ctx.reply(`Added to group 📁 ${name}`);
+  });
+
+  bot.command("ungroup", async (ctx) => {
+    const rec = recOf(ctx);
+    const name = ctx.match?.trim();
+    if (!rec || !name) return void ctx.reply("Usage: /ungroup <name>");
+    removeFromGroup(store, name, rec.key);
+    await ctx.reply(`Removed from 📁 ${name}`);
+  });
+
+  bot.command("account", async (ctx) => {
+    const arg = ctx.match?.trim();
+    if (arg?.startsWith("add ")) {
+      const [, name, dir] = arg.split(/\s+/);
+      if (!name) return void ctx.reply("Usage: /account add <name> [configDir]");
+      const configDir = dir ?? `${process.env.HOME}/.claude-${name}`;
+      cfg.accounts.push({ name, configDir });
+      saveConfig(cfg);
+      await ctx.reply(
+        `Account <b>${esc(name)}</b> added.\nOne-time setup on the Mac:\n<pre><code>mkdir -p ${esc(configDir)}\nCLAUDE_CONFIG_DIR=${esc(configDir)} claude auth login</code></pre>\n⚠️ The path string must stay exactly <code>${esc(configDir)}</code> (the keychain entry is keyed on it).`,
+        { parse_mode: "HTML" },
+      );
+      return;
+    }
+    // Inside a session topic → switch THIS session's account (moves history to the
+    // other pool). In General / no topic → set the default for NEW sessions.
+    const tid = ctx.message?.message_thread_id;
+    const rec = cfg.forumMode ? (tid ? store.byTopic(tid) : undefined) : (activeKey ? store.sessions.get(activeKey) : undefined);
+    if (rec && rec.kind === "managed") {
+      const kb = new InlineKeyboard();
+      cfg.accounts.forEach((a, i) => kb.text(a.name === rec.account ? `✓ ${a.name}` : `🔁 ${a.name}`, `sw:${rec.key}:${i}`).row());
+      await ctx.reply(
+        `<b>Account for THIS session</b> — current: <b>${esc(rec.account)}</b>\nSwitching moves the conversation (full history) onto that account's limit pool.\n<i>To change the default for new sessions instead, run /account in General.</i>`,
+        { parse_mode: "HTML", reply_markup: kb },
+      );
+      return;
+    }
+    const kb = new InlineKeyboard();
+    cfg.accounts.forEach((a, i) => kb.text(a.name === cfg.activeAccount ? `• ${a.name}` : a.name, `acc:${i}`).row());
+    await ctx.reply("Account for NEW sessions:\n<i>run /account inside a session topic to switch that session · /account add &lt;name&gt; to onboard another</i>", { parse_mode: "HTML", reply_markup: kb });
+  });
+
+  bot.command("unwatch", async (ctx) => {
+    const rec = recOf(ctx);
+    if (!rec || rec.kind !== "watch") return void ctx.reply("This isn't a watch topic.");
+    cockpit.unwatch(rec);
+    await ctx.reply("👁 stopped watching.");
+  });
+
+  // ---- callbacks ----
+  bot.on("callback_query:data", async (ctx) => {
+    const data = ctx.callbackQuery.data;
+    const done = (t?: string): Promise<unknown> => ctx.answerCallbackQuery(t ? { text: t } : undefined).catch(() => undefined);
+    const [head, ...rest] = data.split(":");
+
+    if (head === "p" || head === "pl" || head === "q") {
+      const [aid, verb] = rest;
+      const a = cockpit.approvals.get(aid);
+      if (!a) return void done("Expired.");
+      const sess = cockpit.live.get(a.sessionKey);
+      const rec = sess?.rec ?? null;
+      const editPrompt = async (verdict: string): Promise<void> => {
+        if (a.messageId && cfg.chatId) {
+          await bot.api.editMessageReplyMarkup(cfg.chatId, a.messageId).catch(() => undefined);
+          await bot.api.sendMessage(cfg.chatId, verdict, { parse_mode: "HTML", ...(rec ? cockpit.threadOpts(rec) : {}) }).catch(() => undefined);
+        }
+      };
+      if (head === "p") {
+        if (verb === "a") { a.resolve({ behavior: "allow", updatedInput: a.input }); cockpit.approvals.delete(aid); await editPrompt("✅ allowed once"); }
+        else if (verb === "d") { a.resolve({ behavior: "deny", message: "Denied by the owner from Telegram." }); cockpit.approvals.delete(aid); await editPrompt("❌ denied"); }
+        else if (verb === "w") {
+          const kb = new InlineKeyboard()
+            .text("This session", `p:${aid}:ws`).row()
+            .text("This project", `p:${aid}:wl`).row()
+            .text("Everywhere (user settings)", `p:${aid}:wu`);
+          await ctx.editMessageReplyMarkup({ reply_markup: kb }).catch(() => undefined);
+        } else if (verb === "ws" || verb === "wl" || verb === "wu") {
+          const destination = verb === "ws" ? "session" : verb === "wl" ? "localSettings" : "userSettings";
+          const updates = (a.suggestions?.length
+            ? a.suggestions.map((s) => ({ ...s, destination }))
+            : [{ type: "addRules", rules: [{ toolName: a.toolName }], behavior: "allow", destination }]) as never;
+          a.resolve({ behavior: "allow", updatedInput: a.input, updatedPermissions: updates });
+          cockpit.approvals.delete(aid);
+          await editPrompt(`♾ always allowed (<i>${destination}</i>)`);
+        }
+        return void done();
+      }
+      if (head === "pl") {
+        if (verb === "a" || verb === "m") {
+          a.resolve({ behavior: "allow", updatedInput: a.input });
+          cockpit.approvals.delete(aid);
+          const mode = verb === "a" ? "acceptEdits" : "default";
+          setTimeout(() => void sess?.setMode(mode).then(() => store.flushSessions()).catch(() => undefined), 500);
+          await editPrompt(`✅ plan approved → mode <b>${mode}</b>`);
+        } else if (verb === "r") {
+          if (rec) awaiting.set(`${cfg.chatId}:${rec.topicId ?? 0}`, { type: "planFeedback", aid });
+          await editPrompt("✏️ Send your revision feedback as a normal message.");
+        } else if (verb === "x") {
+          a.resolve({ behavior: "deny", message: "Plan rejected by the user. Stop and wait for new instructions.", interrupt: true });
+          cockpit.approvals.delete(aid);
+          await editPrompt("❌ plan rejected");
+        }
+        return void done();
+      }
+      if (head === "q") {
+        const q = (a.input.questions as Array<Record<string, unknown>> | undefined)?.[0];
+        if (verb === "o") {
+          if (rec) awaiting.set(`${cfg.chatId}:${rec.topicId ?? 0}`, { type: "questionOther", aid });
+          await editPrompt("✍️ Send your answer as a normal message.");
+        } else {
+          const opts = (q?.options as Array<{ label: string }> | undefined) ?? [];
+          const label = opts[Number(verb)]?.label ?? verb;
+          a.resolve({ behavior: "allow", updatedInput: { ...a.input, answers: { [String(q?.question ?? "q")]: label } } });
+          cockpit.approvals.delete(aid);
+          await editPrompt(`💬 answered: <b>${esc(label)}</b>`);
+        }
+        return void done();
+      }
+    }
+
+    if (head === "np") {
+      newDirsPage = Math.max(0, Math.min(Number(rest[0]), Math.ceil(newDirs.length / DIRS_PER_PAGE) - 1));
+      await ctx.editMessageReplyMarkup({ reply_markup: newDirsKb(newDirsPage) }).catch(() => undefined);
+      return void done();
+    }
+    if (head === "dir") {
+      const dir = newDirs[Number(rest[0])];
+      awaiting.delete(threadKey(ctx));
+      await ctx.editMessageText(`Directory → <code>${esc(dir ?? "?")}</code> ✅`, { parse_mode: "HTML" }).catch(() => undefined);
+      await done();
+      if (dir) await startSession(dir);
+      return;
+    }
+    if (head === "noop") return void done();
+    if (head === "fp") { // foreign-session permission/plan verdict
+      const fa = cockpit.foreignApprovals.get(rest[0]);
+      if (!fa) return void done("expired");
+      const verb = rest[1];
+      if (verb === "a") { fa.resolve({ decision: "allow" }); await ctx.editMessageText("✅ allowed once (foreign session)").catch(() => undefined); }
+      else if (verb === "d") { fa.resolve({ decision: "deny", reason: "Denied by owner from phone." }); await ctx.editMessageText("❌ denied (foreign session)").catch(() => undefined); }
+      else if (verb === "w") {
+        foreignAlways.add(`${fa.cwd}::${fa.tool}`);
+        fa.resolve({ decision: "allow" });
+        await ctx.editMessageText(`♾ Always allowing <b>${esc(fa.tool)}</b> in this project while away.`, { parse_mode: "HTML" }).catch(() => undefined);
+      }
+      else if (verb === "pa") { fa.resolve({ decision: "allow" }); await ctx.editMessageText("✅ plan approved (foreign session)").catch(() => undefined); }
+      else if (verb === "px") { fa.resolve({ decision: "deny", reason: "Plan rejected by owner from phone. Stop and wait for new instructions." }); await ctx.editMessageText("❌ plan rejected (foreign session)").catch(() => undefined); }
+      else if (verb === "pv") {
+        pendingForeignRevise = rest[0];
+        await ctx.editMessageText("✏️ Send your revision feedback as a normal message.").catch(() => undefined);
+      }
+      return void done();
+    }
+    if (head === "mk") { // recreate a missing session folder, then resume/fork
+      const s = lastList[Number(rest[0])];
+      if (!s) return void done("Run /sessions again.");
+      const cwd = sessionCwd(s.file) ?? s.cwd;
+      try { fs.mkdirSync(cwd, { recursive: true }); } catch { /* report below */ }
+      await ctx.editMessageText(fs.existsSync(cwd) ? `📁 Recreated <code>${esc(cwd)}</code> — resuming…` : `⚠️ Couldn't create <code>${esc(cwd)}</code>`, { parse_mode: "HTML" }).catch(() => undefined);
+      await done();
+      if (fs.existsSync(cwd)) await resumeLocal(s, rest[1] === "1");
+      return;
+    }
+    if (head === "pp") { // projects list pagination
+      projectsPage = Math.max(0, Math.min(Number(rest[0]), Math.ceil(projects.length / PROJECTS_PER_PAGE) - 1));
+      await ctx.editMessageText(projectsText(), { parse_mode: "HTML", reply_markup: projectsKb(projectsPage) }).catch(() => undefined);
+      return void done();
+    }
+    if (head === "projs") { // back to the projects list
+      await ctx.editMessageText(projectsText(), { parse_mode: "HTML", reply_markup: projectsKb(projectsPage) }).catch(() => undefined);
+      return void done();
+    }
+    if (head === "proj") { // open one project's sessions
+      curProject = Number(rest[0]); projSessPage = 0;
+      if (!projects[curProject]) return void done("Run /sessions again.");
+      await ctx.editMessageText(projSessText(curProject), { parse_mode: "HTML", reply_markup: projSessKb(curProject, 0) }).catch(() => undefined);
+      return void done();
+    }
+    if (head === "ps") { // sessions pagination within a project
+      const pi = Number(rest[0]); projSessPage = Number(rest[1]);
+      if (!projects[pi]) return void done();
+      await ctx.editMessageText(projSessText(pi), { parse_mode: "HTML", reply_markup: projSessKb(pi, projSessPage) }).catch(() => undefined);
+      return void done();
+    }
+    if (head === "sl") {
+      const restoreList = async (): Promise<void> => {
+        if (curProject >= 0 && projects[curProject])
+          await ctx.editMessageText(projSessText(curProject), { parse_mode: "HTML", reply_markup: projSessKb(curProject, projSessPage) }).catch(() => undefined);
+      };
+      if (rest[0] === "back") { await restoreList(); return void done(); }
+      const idx = Number(rest[0]);
+      const s = lastList[idx];
+      if (!s) return void done("Run /sessions again.");
+      if (rest[1] === "m") {
+        // Update the message TEXT to the picked session, and show its actions.
+        const mark = s.live ? "🟢 live now" : s.archived ? "🗄 archived" : "⚪️ resumable";
+        const txt = `<b>${esc(s.title ?? path.basename(s.realCwd ?? s.cwd))}</b>\n` +
+          `<code>${esc(shortPath(s.realCwd ?? s.cwd))}</code>\n` +
+          `${mark} · <i>${fmtAgo(s.mtime)}</i>\n\nChoose an action:`;
+        const kb = new InlineKeyboard();
+        if (bridgeManaged(s.sessionId)) {
+          kb.text("▶️ Go to its topic (open here)", `sl:${idx}:r`).row(); // our own live session
+        } else if (s.live) {
+          kb.text("🛑 Close on Mac & continue here", `sl:${idx}:c`).row();
+          kb.text("🔀 Fork instead (leave it running)", `sl:${idx}:f`).row();
+        } else {
+          kb.text("▶️ Continue here", `sl:${idx}:r`).row();
+        }
+        kb.text("👁 Mirror its output here", `sl:${idx}:w`).row();
+        kb.text("ℹ️ Details", `sl:${idx}:i`).row();
+        kb.text("« Back", "sl:back");
+        await ctx.editMessageText(txt, { parse_mode: "HTML", reply_markup: kb }).catch(() => undefined);
+        return void done();
+      }
+      // A real action: collapse the menu back to the project's session list first.
+      await restoreList();
+      await done();
+      if (rest[1] === "r") await resumeLocal(s, false);
+      else if (rest[1] === "f") await resumeLocal(s, true);
+      else if (rest[1] === "c") {
+        // Close a stale foreign live session (open on the Mac/desktop) so it frees up to
+        // resume here. SIGTERM lets Claude Code flush + exit cleanly; escalate if needed.
+        const pid = s.pid;
+        if (!pid) { await cockpit.say(null, "Couldn't find its process id — try Mirror or Fork."); return; }
+        const alive = (): boolean => { try { process.kill(pid, 0); return true; } catch { return false; } };
+        try { process.kill(pid, "SIGTERM"); } catch { /* already gone */ }
+        for (let i = 0; i < 12 && alive(); i++) await new Promise((r) => setTimeout(r, 500));
+        if (alive()) { try { process.kill(pid, "SIGKILL"); } catch { /* */ } await new Promise((r) => setTimeout(r, 800)); }
+        if (alive()) { await cockpit.say(null, `⚠️ Couldn't close it (pid ${pid} still running — it may be mid-task). Try again, or Fork.`); return; }
+        s.live = false; s.pid = undefined;
+        await cockpit.say(null, `🛑 Closed on the Mac (pid ${pid}). Resuming here…`);
+        await resumeLocal(s, false);
+      }
+      else if (rest[1] === "w") {
+        const rec: SessionRec = {
+          key: store.newKey(), sessionId: s.sessionId, cwd: sessionCwd(s.file) ?? s.cwd,
+          account: s.account, mode: "n/a", status: "watching", kind: "watch",
+          title: `👁 ${s.title ?? path.basename(s.cwd)}`, createdAt: Date.now(), lastActivityAt: Date.now(),
+        };
+        rec.topicId = await cockpit.makeTopic(rec.title!);
+        await cockpit.watch(s.file, rec);
+        await cockpit.say(rec, `👁 Watching <b>${esc(s.title ?? s.sessionId.slice(0, 8))}</b> — new activity will mirror here. /unwatch to stop.\n<i>To type into it: open it on the Mac (it's live there) or Fork it here.</i>`);
+      } else if (rest[1] === "i") {
+        const t = transcriptContextPct(s.file);
+        await cockpit.say(null, [
+          `ℹ️ <b>${esc(s.title ?? s.sessionId)}</b>`,
+          `<code>${esc(s.sessionId)}</code>`,
+          `cwd <code>${esc(sessionCwd(s.file) ?? s.cwd)}</code>`,
+          `account <b>${esc(s.account)}</b> · ${s.live ? `🟢 live (pid ${s.pid})` : `⚪️ last active ${fmtAgo(s.mtime)}`} · ${(s.size / 1024).toFixed(0)}KB`,
+          t ? `context ~${fmtPct(t.pct)} · model ${esc(t.model)}` : "",
+          s.live ? `open on Mac: <code>open 'claude://resume?session=${esc(s.sessionId)}'</code>` : "",
+        ].filter(Boolean).join("\n"));
+      }
+      return;
+    }
+    if (head === "use") {
+      activeKey = rest[0];
+      const t = store.sessions.get(rest[0])?.title ?? rest[0];
+      await ctx.editMessageText(`Active session → <b>${esc(t)}</b> ✅`, { parse_mode: "HTML" }).catch(() => undefined);
+      return void done();
+    }
+    if (head === "mo") {
+      const rec = recOf(ctx);
+      const sess = rec && cockpit.live.get(rec.key);
+      if (sess) {
+        await sess.setMode(rest[0]);
+        store.flushSessions();
+        await ctx.editMessageText(`Permission mode → <b>${modeLabel(rest[0])}</b> ✅`, { parse_mode: "HTML" }).catch(() => undefined);
+      } else await ctx.editMessageText("No live session here — resume it first.").catch(() => undefined);
+      return void done();
+    }
+    if (head === "ef") {
+      const rec = recOf(ctx);
+      const sess = rec && cockpit.live.get(rec.key);
+      const id = rest[0];
+      const label = effortLabel(id);
+      if (!rec) {
+        await ctx.editMessageText("No session here.").catch(() => undefined);
+        return void done();
+      }
+      if (!sess) {
+        rec.effort = id;
+        store.flushSessions();
+        await ctx.editMessageText(`Effort → <b>${label}</b> ✅ <i>(applies when the session resumes)</i>`, { parse_mode: "HTML" }).catch(() => undefined);
+        return void done();
+      }
+      if (id === "max") {
+        await ctx.editMessageText("Effort → <b>Max</b> ✅ <i>(respawning + resuming…)</i>", { parse_mode: "HTML" }).catch(() => undefined);
+        await done();
+        await cockpit.respawn(sess, { effort: "max" });
+        await cockpit.say(rec, "⚡ Effort is now <b>Max</b> — session resumed where it left off.");
+        return;
+      }
+      try {
+        await sess.setEffort(id);
+        store.flushSessions();
+        await ctx.editMessageText(
+          `Effort → <b>${label}</b> ✅${id === "ultracode" ? " <i>— multi-agent workflows now on for this session</i>" : ""}`,
+          { parse_mode: "HTML" },
+        ).catch(() => undefined);
+      } catch (e) {
+        await ctx.editMessageText(`Couldn't switch effort: ${esc(e instanceof Error ? e.message : String(e))}`).catch(() => undefined);
+      }
+      return void done();
+    }
+    if (head === "md") {
+      const [key, idx] = rest;
+      const sess = cockpit.live.get(key);
+      const rec2 = store.sessions.get(key);
+      const choice = modelChoices.get(key)?.[Number(idx)];
+      if (choice && (sess || rec2)) {
+        if (sess) await sess.setModel(choice.id);
+        else if (rec2) rec2.model = choice.id;
+        store.flushSessions();
+        const suffix = sess ? "" : " <i>(applies when the session resumes)</i>";
+        await ctx.editMessageText(`Model → <b>${esc(modelVersion(choice))}</b> ✅${suffix}`, { parse_mode: "HTML" }).catch(() => undefined);
+      } else await ctx.editMessageText("That session is gone — run /sessions.").catch(() => undefined);
+      return void done();
+    }
+    if (head === "sw") {
+      const [key, idx] = rest;
+      const rec = store.sessions.get(key);
+      const target = cfg.accounts[Number(idx)];
+      if (!rec || !target) return void done("Gone — run /sessions.");
+      if (rec.account === target.name) {
+        await ctx.editMessageText(`Already on <b>${esc(target.name)}</b> ✓`, { parse_mode: "HTML" }).catch(() => undefined);
+        return void done();
+      }
+      await ctx.editMessageText(`🔁 Moving this session to <b>${esc(target.name)}</b>…`, { parse_mode: "HTML" }).catch(() => undefined);
+      await done();
+      try {
+        await cockpit.moveSession(rec, target);
+        await cockpit.say(rec, `🔁 This session now runs on <b>${esc(target.name)}</b> — history intact, fresh pool. Just keep typing.`);
+      } catch (e) {
+        await cockpit.say(rec, `⚠️ Move failed: ${esc(e instanceof Error ? e.message : String(e))}`);
+      }
+      return;
+    }
+    if (head === "acc") {
+      const a = cfg.accounts[Number(rest[0])];
+      if (a) {
+        cfg.activeAccount = a.name;
+        saveConfig(cfg);
+        await ctx.editMessageText(`New sessions will use <b>${esc(a.name)}</b> ✅`, { parse_mode: "HTML" }).catch(() => undefined);
+      }
+      return void done();
+    }
+    if (head === "pf") {
+      const f = planFiles[Number(rest[0])];
+      await done();
+      if (f) await ctx.replyWithDocument(new InputFile(f)).catch(() => undefined);
+      return;
+    }
+    await done();
+  });
+
+  // ---- plain messages: input routing ----
+  bot.on("message:text", async (ctx) => {
+    const text = ctx.message.text;
+    // Claude Code's own slash commands pass through to the session; other unknown
+    // /commands are dropped (registered bot commands were already consumed above).
+    if (text.startsWith("/") && !/^\/(compact|context|clear)\b/.test(text)) return;
+    if (pendingForeignRevise) { // revision feedback for a foreign-session plan (owner-only, topic-agnostic)
+      const fa = cockpit.foreignApprovals.get(pendingForeignRevise);
+      pendingForeignRevise = null;
+      if (!fa) return void ctx.reply("That plan prompt expired.");
+      fa.resolve({ decision: "deny", reason: `Revise the plan based on this feedback and re-present it: ${text}` });
+      return void ctx.reply("✏️ Feedback sent — the desktop session will revise the plan.");
+    }
+    const tk = `${cfg.chatId}:${ctx.message.message_thread_id ?? 0}`;
+    const wait = awaiting.get(tk) ?? awaiting.get(threadKey(ctx));
+    if (wait) {
+      awaiting.delete(tk);
+      awaiting.delete(threadKey(ctx));
+      if (wait.type === "dir") {
+        const abs = text.trim().startsWith("~") ? text.trim().replace("~", process.env.HOME ?? "") : text.trim();
+        const ok = await startSession(path.resolve(abs));
+        if (!ok) await ctx.reply(`Directory not found: ${abs}`);
+        return;
+      }
+      const a = cockpit.approvals.get(wait.aid);
+      if (!a) return void ctx.reply("That prompt expired.");
+      if (wait.type === "planFeedback") {
+        a.resolve({ behavior: "deny", message: `Revise the plan based on this feedback: ${text}` });
+        cockpit.approvals.delete(wait.aid);
+        await ctx.reply("✏️ Feedback sent — Claude is revising the plan.");
+      } else {
+        const q = (a.input.questions as Array<Record<string, unknown>> | undefined)?.[0];
+        a.resolve({ behavior: "allow", updatedInput: { ...a.input, answers: { [String(q?.question ?? "q")]: text } } });
+        cockpit.approvals.delete(wait.aid);
+        await ctx.reply("💬 Answer sent.");
+      }
+      return;
+    }
+    const rec = recOf(ctx);
+    if (!rec) return void ctx.reply("No session bound here. /new to start one, /sessions to resume, /use to pick (flat mode).");
+    if (rec.kind === "watch") return void ctx.reply("This is a watch-only mirror. Fork it (/sessions → Fork) to interact.");
+    let sess = cockpit.live.get(rec.key);
+    if (!sess && rec.sessionId) {
+      await ctx.reply("💤 Session was detached — resuming…");
+      sess = await cockpit.spawn(rec, { resume: rec.sessionId });
+    }
+    if (!sess) return void ctx.reply("Session is gone. /new to start fresh.");
+    sess.send(text);
+  });
+
+  bot.on("message:photo", async (ctx) => {
+    const rec = recOf(ctx);
+    if (!rec) return void ctx.reply("No session here — /new or /sessions first.");
+    let sess = cockpit.live.get(rec.key);
+    if (!sess && rec.kind === "managed" && rec.sessionId) {
+      // Same auto-resume as typed text: a detached session should accept photos too.
+      await ctx.reply("💤 Session was detached — resuming…");
+      await cockpit.spawn(rec, { resume: rec.sessionId });
+      sess = cockpit.live.get(rec.key);
+    }
+    if (!sess) return void ctx.reply("No live session here for the photo.");
+    try {
+      const photo = ctx.message.photo[ctx.message.photo.length - 1];
+      const f = await ctx.api.getFile(photo.file_id);
+      const url = `https://api.telegram.org/file/bot${token}/${f.file_path}`;
+      const buf = Buffer.from(await (await fetch(url)).arrayBuffer());
+      sess.sendImage(buf.toString("base64"), "image/jpeg", ctx.message.caption);
+      await ctx.reply("🖼 sent to Claude.");
+    } catch (e) {
+      await ctx.reply(`Photo failed: ${e instanceof Error ? e.message : e}`);
+    }
+  });
+
+  void bot.api.setMyCommands([
+    { command: "new", description: "New session in a directory" },
+    { command: "sessions", description: "All local sessions (resume/fork/watch)" },
+    { command: "info", description: "Full details: session, usage, limits, account" },
+    { command: "usage", description: "5h + weekly limits per account" },
+    { command: "model", description: "Switch model" },
+    { command: "mode", description: "Switch permission mode" },
+    { command: "effort", description: "Switch effort level" },
+    { command: "stop", description: "Interrupt the current turn" },
+    { command: "copy", description: "Re-send last output as copyable block" },
+    { command: "plan", description: "Show current plan" },
+    { command: "tasks", description: "Background tasks/todos" },
+    { command: "files", description: "git status in session cwd" },
+    { command: "routines", description: "Local scheduled tasks" },
+    { command: "groups", description: "Session groups" },
+    { command: "account", description: "Switch/add Claude account" },
+    { command: "foreign", description: "Away-mode: relay desktop prompts to phone" },
+    { command: "help", description: "All commands" },
+  ]).catch(() => undefined);
+
+  return { bot, cockpit };
+}

@@ -1,0 +1,7 @@
+node_modules/
+dist/
+*.log
+.DS_Store
+.env
+# runtime state (bridge config, pairing code, session map, usage cache) lives in
+# ~/.claude/bridge-state — never in the repo
