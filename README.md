@@ -121,6 +121,19 @@ launchctl bootout "gui/$(id -u)/com.claude-code-telegram-cockpit.bridge"
 git pull && ./setup.sh
 ```
 
+## Configuration
+
+Tunables live in `~/.claude/bridge-state/config.json` (created and managed by the daemon). Sensible
+defaults apply when a key is absent — add a key only to override it:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `usageWarnPct` | `90` | Warn in Telegram when the 5-hour usage window crosses this percentage. |
+| `approvalTimeoutMin` | `15` | Auto-deny a managed permission/plan/question prompt left unanswered for this many minutes — a fail-safe so a never-tapped prompt can't hang the session. |
+
+`ownerId`, `chatId`, `accounts`, and `activeAccount` in the same file are managed by the daemon during
+pairing and normal use — you don't normally edit those by hand.
+
 ## Commands
 
 | Command | What it does |
