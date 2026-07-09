@@ -6,16 +6,15 @@
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import os from "node:os";
-import { HOME, STATE_DIR, keychain, keychainWrite, type AccountCfg } from "../config.js";
+import { HOME, STATE_DIR, keychain, type AccountCfg } from "../config.js";
 import type { RateInfo } from "./sessionManager.js";
 
 const CLAUDE_VERSION = "2.1.201"; // for the User-Agent the endpoint requires
-const OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"; // Claude Code's public OAuth client
-const KEYCHAIN_ACCOUNT = os.userInfo().username; // entries are keyed on the macOS username
 
 export interface WindowUsage { pct?: number; resetsAt?: number; source: string; at: number }
-export interface AccountUsage { fiveHour?: WindowUsage; sevenDay?: WindowUsage }
+/** needsReauth = the account's access token is present but the API rejected it (401); it must be
+ *  re-logged-in on the Mac. We never auto-refresh (that would rotate the CLI's own refresh token). */
+export interface AccountUsage { fiveHour?: WindowUsage; sevenDay?: WindowUsage; needsReauth?: boolean }
 
 const streamCache = new Map<string, AccountUsage>(); // account -> latest from rate_limit_events
 
@@ -69,41 +68,11 @@ export function accountConnected(a: AccountCfg): boolean {
   try { return Boolean(JSON.parse(raw)?.claudeAiOauth?.accessToken); } catch { return false; }
 }
 
-/** Refresh a stale access token using the stored refresh token, writing the result back to
- *  the Keychain in place. Safe: writes ONLY on a validated 200; any error is a no-op.
- *  Also hardens the reboot case where the CLI token goes stale. Returns the new token or null. */
-async function refreshToken(a: AccountCfg): Promise<string | null> {
-  const svc = credentialService(a);
-  const raw = keychain(svc);
-  if (!raw) return null;
-  let creds: { claudeAiOauth?: Record<string, unknown> };
-  try { creds = JSON.parse(raw); } catch { return null; }
-  const rt = creds.claudeAiOauth?.refreshToken;
-  if (typeof rt !== "string" || rt.length < 20) return null;
-  try {
-    const res = await fetch("https://console.anthropic.com/v1/oauth/token", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ grant_type: "refresh_token", refresh_token: rt, client_id: OAUTH_CLIENT_ID }),
-      signal: AbortSignal.timeout(10_000),
-    });
-    if (!res.ok) return null;
-    const d = (await res.json()) as { access_token?: string; refresh_token?: string; expires_in?: number };
-    // Rigorous guards — only overwrite credentials on a plausibly-valid response.
-    if (typeof d.access_token !== "string" || d.access_token.length < 20 || typeof d.expires_in !== "number") return null;
-    const updated = {
-      ...creds,
-      claudeAiOauth: {
-        ...creds.claudeAiOauth,
-        accessToken: d.access_token,
-        refreshToken: typeof d.refresh_token === "string" && d.refresh_token.length >= 20 ? d.refresh_token : rt,
-        expiresAt: Date.now() + d.expires_in * 1000,
-      },
-    };
-    if (!keychainWrite(svc, KEYCHAIN_ACCOUNT, JSON.stringify(updated))) return null;
-    return d.access_token;
-  } catch { return null; }
-}
+// NOTE: we deliberately do NOT refresh access tokens. Calling the OAuth token endpoint rotates the
+// refresh token server-side, which would invalidate the Claude CLI's own stored credential and log it
+// out globally (the whole account, everywhere). For an idle account whose access token has expired we
+// report `needsReauth` and let the user re-login on the Mac. The ACTIVE account's token is kept fresh
+// by the CLI itself during normal use, so its usage numbers keep working.
 
 async function oauthUsage(a: AccountCfg, attempt = 0): Promise<AccountUsage> {
   const out: AccountUsage = {};
@@ -126,12 +95,9 @@ async function oauthUsage(a: AccountCfg, attempt = 0): Promise<AccountUsage> {
       await new Promise((r) => setTimeout(r, wait));
       return oauthUsage(a, attempt + 1);
     }
-    // Stale token → refresh once via the refresh token, then retry with the new one.
-    if (res.status === 401 && attempt < 1) {
-      const fresh = await refreshToken(a);
-      if (fresh) return oauthUsage(a, attempt + 1);
-      return out;
-    }
+    // Stale/expired token. We do NOT refresh (that would rotate the CLI's own refresh token and log
+    // it out) — surface `needsReauth` so the user can re-login on the Mac.
+    if (res.status === 401) return { needsReauth: true };
     if (!res.ok) return out;
     const d = (await res.json()) as Record<string, { utilization?: number; resets_at?: string }>;
     const now = Date.now();
@@ -175,19 +141,25 @@ export async function accountUsage(a: AccountCfg): Promise<AccountUsage> {
   };
   const freshEnough = (w?: WindowUsage): boolean => Boolean(unexpired(w) && Date.now() - w!.at < 10 * 60_000);
   let merged: AccountUsage = { fiveHour: pick(live.fiveHour, snap.fiveHour), sevenDay: pick(live.sevenDay, snap.sevenDay) };
+  let needsReauth = false;
   if (!freshEnough(merged.fiveHour) || !freshEnough(merged.sevenDay)) {
     if (Date.now() >= (nextPoll.get(a.name) ?? 0)) {
       const api = await oauthUsage(a);
       if (api.fiveHour || api.sevenDay) {
         apiCache.set(a.name, api); persistCache();
         nextPoll.set(a.name, Date.now() + 180_000);       // success: respect the ~180s poll floor
+      } else if (api.needsReauth) {
+        needsReauth = true;
+        nextPoll.set(a.name, Date.now() + 600_000);       // expired token won't self-heal: don't hammer the 401
       } else {
-        nextPoll.set(a.name, Date.now() + 20_000);        // failure (429/stale token): retry soon, don't lock out
+        nextPoll.set(a.name, Date.now() + 20_000);        // transient failure (429/network): retry soon, don't lock out
       }
     }
   }
   const cached = apiCache.get(a.name) ?? {};
   merged = { fiveHour: pick(merged.fiveHour, cached.fiveHour), sevenDay: pick(merged.sevenDay, cached.sevenDay) };
+  // Only surface "reauth needed" when we have nothing else to show (cached numbers win if present).
+  if (needsReauth && !merged.fiveHour && !merged.sevenDay) merged.needsReauth = true;
   return merged;
 }
 

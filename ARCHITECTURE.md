@@ -22,9 +22,9 @@ classes of session:
 | `telegram/cockpit.ts` | Rendering: streaming edits, chunking, permission/plan/question UI |
 | `telegram/render.ts` | HTML escaping, markdown→Telegram-HTML, chunking, formatting helpers |
 | `core/sessionManager.ts` | One SDK `query()` per managed session; permission/plan/effort control |
-| `core/observer.ts` | Tails foreign-session transcripts (`chokidar`) for live mirroring |
+| `core/observer.ts` | Tails foreign-session transcripts (`fs.watch` + a polling fallback) for live mirroring |
 | `core/inventory.ts` | Reads Claude Code's on-disk state: session index, routines, tasks, plans |
-| `core/usage.ts` | Usage limits: statusline snapshots → OAuth usage endpoint → transcript fallback; token auto-refresh |
+| `core/usage.ts` | Usage limits: statusline snapshots → OAuth usage endpoint → transcript fallback (read-only; never writes/refreshes tokens) |
 | `core/groups.ts` | User-defined session groups |
 | `core/permServer.ts` | Localhost HTTP endpoint the away-mode hook calls (token-authenticated) |
 | `core/foreignPerms.ts` | Installs/removes the `PermissionRequest` hook in `settings.json` |
@@ -45,8 +45,9 @@ classes of session:
 - **Session list** comes from the desktop app's own session index sidecars, so it matches what
   you see in the app (real titles, cwds, archived flags), excluding automated scheduled runs.
 - **Live output** for foreign sessions is tailed from the shared transcript JSONL store.
-- **Usage** prefers live SDK/statusline data, then the OAuth usage endpoint (per account, with
-  token auto-refresh), then a transcript-derived estimate.
+- **Usage** prefers live SDK/statusline data, then the OAuth usage endpoint (per account,
+  read-only — an expired token surfaces "reauth needed" rather than being refreshed, to avoid
+  rotating the CLI's own credential), then a transcript-derived estimate.
 
 These are Claude Code internals and can drift between versions; parsers ignore unknown fields
 and fail soft.
@@ -61,5 +62,7 @@ Everything mutable lives under `~/.claude/bridge-state/` (mode 700), never in th
 
 - Telegram via **long-polling** — no inbound ports, works behind NAT.
 - First-middleware **allowlist** on the single owner's numeric user id.
-- The away-mode HTTP endpoint binds `127.0.0.1` only and requires a shared token.
-- Tokens live in the macOS **Keychain**.
+- The away-mode HTTP endpoint binds `127.0.0.1` only and requires a shared token. That shared
+  token lives in `~/.claude/bridge-state/foreign-perms.json` (plaintext, inside the mode-700 state
+  dir), **not** the Keychain.
+- The **bot token** lives in the macOS **Keychain**, never in files or the repo.

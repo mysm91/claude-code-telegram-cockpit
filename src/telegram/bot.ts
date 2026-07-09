@@ -517,7 +517,7 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
     const weekLine = wline(u.sevenDay, "weekly");
     if (fiveLine) lines.push(fiveLine);
     if (weekLine) lines.push(weekLine);
-    if (!fiveLine && !weekLine) lines.push("▫️ limits n/a — run a turn on this account first");
+    if (!fiveLine && !weekLine) lines.push(u.needsReauth ? "▫️ limits n/a — reauth needed (log in again on the Mac)" : "▫️ limits n/a — run a turn on this account first");
 
     lines.push("", "<b>Setup</b>");
     lines.push(`model <code>${esc(rec.model ?? tModel ?? "default")}</code>`);
@@ -550,7 +550,9 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
       if (u.fiveHour) lines.push(`5h  ${usageBar(u.fiveHour.pct)} ${fmtReset(u.fiveHour.resetsAt)} <i>(${u.fiveHour.source}, ${fmtAgo(u.fiveHour.at)})</i>`);
       if (u.sevenDay) lines.push(`week ${usageBar(u.sevenDay.pct)} ${fmtReset(u.sevenDay.resetsAt)} <i>(${u.sevenDay.source}, ${fmtAgo(u.sevenDay.at)})</i>`);
       if (!u.fiveHour && !u.sevenDay)
-        lines.push("<i>logged in, but no reading yet — its token is idle. Use it once (/new here, or move a session to it) and it'll show.</i>");
+        lines.push(u.needsReauth
+          ? "<i>n/a — reauth needed: its token has expired. Log in again on the Mac (see /account).</i>"
+          : "<i>logged in, but no reading yet — its token is idle. Use it once (/new here, or move a session to it) and it'll show.</i>");
     }
     if (!connected.length) lines.push("\n<i>No accounts connected. Log one in on the Mac (see /account).</i>");
     if (dormant.length) lines.push(`\n<i>Not connected: ${dormant.map((a) => esc(a.name)).join(", ")} — run its login on the Mac to include it.</i>`);

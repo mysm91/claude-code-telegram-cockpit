@@ -4,6 +4,7 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 export interface AccountCfg {
   name: string;
@@ -27,7 +28,7 @@ export interface BridgeConfig {
   usageWarnPct: number;
 }
 
-export const ROOT = path.dirname(path.dirname(new URL(import.meta.url).pathname)); // project root (dist/..)
+export const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url))); // project root (dist/..); fileURLToPath decodes %20/unicode so paths with spaces work
 export const HOME = os.homedir();
 export const STATE_DIR = path.join(HOME, ".claude", "bridge-state");
 export const CONFIG_PATH = path.join(STATE_DIR, "config.json");
@@ -64,17 +65,6 @@ export function keychain(service: string, account?: string): string | null {
   } catch {
     return null;
   }
-}
-
-/** Update (or create) a Keychain generic-password entry in place. Returns true on success.
- *  Verified: `-U` updates the existing record without duplicating (account = macOS user). */
-export function keychainWrite(service: string, account: string, secret: string): boolean {
-  try {
-    execFileSync("/usr/bin/security",
-      ["add-generic-password", "-U", "-s", service, "-a", account, "-w", secret],
-      { stdio: "ignore" });
-    return true;
-  } catch { return false; }
 }
 
 export function botToken(): string | null {
