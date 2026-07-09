@@ -183,14 +183,29 @@ export class Cockpit {
 
   private async renderApproval(s: ManagedSession, a: PendingApproval): Promise<void> {
     this.approvals.set(a.id, a);
+    // Fail-safe (review finding #8): if this prompt is never answered — or the Telegram send below
+    // fails — auto-deny after the configured timeout so the SDK tool call can't hang the session
+    // forever. Any real answer (or the abort listener) goes through a.resolve, which clears the timer.
+    const timer = setTimeout(() => {
+      this.approvals.delete(a.id);
+      if (a.messageId && this.cfg.chatId)
+        void this.api.editMessageText(this.cfg.chatId, a.messageId, "⌛ timed out — no response; falling back to the safe default.").catch(() => undefined);
+      a.resolve({ behavior: "deny", message: "Timed out awaiting a Telegram response." });
+    }, (this.cfg.approvalTimeoutMin ?? 15) * 60_000);
+    const origResolve = a.resolve;
+    a.resolve = (r): void => { clearTimeout(timer); origResolve(r); };
+    // If the prompt never reached Telegram (no chatId / all sends failed), don't dangle — deny now.
+    const guardDelivery = (): void => {
+      if (a.messageId === undefined) a.resolve({ behavior: "deny", message: "Couldn't deliver the approval prompt to Telegram." });
+    };
     if (a.kind === "plan") {
       const kb = new InlineKeyboard()
         .text("✅ Approve → auto-accept edits", `pl:${a.id}:a`).row()
         .text("✅ Approve (manual approvals)", `pl:${a.id}:m`).row()
         .text("✏️ Revise", `pl:${a.id}:r`).text("❌ Reject", `pl:${a.id}:x`);
       const plan = mdToHtml(String(a.input.plan ?? "(empty plan)"));
-      const msgId = await this.say(s.rec, `📋 <b>Plan ready for review</b>\n\n${plan}`, kb);
-      a.messageId = msgId;
+      a.messageId = await this.say(s.rec, `📋 <b>Plan ready for review</b>\n\n${plan}`, kb);
+      guardDelivery();
       return;
     }
     if (a.kind === "question") {
@@ -201,6 +216,7 @@ export class Cockpit {
       kb.text("✍️ Other…", `q:${a.id}:o`);
       const lines = opts.map((o, i) => `${i + 1}. <b>${esc(o.label)}</b>${o.description ? ` — ${esc(o.description)}` : ""}`);
       a.messageId = await this.say(s.rec, `❓ <b>${esc(String(q?.question ?? "Claude asks:"))}</b>\n\n${lines.join("\n")}`, kb);
+      guardDelivery();
       return;
     }
     const title = a.title ?? `Claude wants to use ${a.toolName}`;
@@ -214,6 +230,7 @@ export class Cockpit {
       `🔐 <b>${esc(title)}</b>${a.description ? `\n${esc(a.description)}` : ""}\n<pre><code>${esc(preview)}</code></pre>`,
       kb,
     );
+    guardDelivery();
   }
 
   private async renderResult(s: ManagedSession, info: { costUsd?: number; turns?: number; isError: boolean; subtype: string }): Promise<void> {
@@ -260,7 +277,11 @@ export class Cockpit {
   private async onExit(s: ManagedSession, reason: string): Promise<void> {
     this.store.flushSessions();
     for (const [id, a] of this.approvals) if (a.sessionKey === s.rec.key) this.approvals.delete(id);
-    if (this.restarting.has(s.rec.key)) return;
+    if (this.restarting.has(s.rec.key)) return; // moveSession/respawn manage `live` themselves
+    // A dead session must NOT linger in `live` (review finding #4): otherwise typed input routes
+    // into its closed queue and silently vanishes instead of triggering a resume. Only delete if
+    // the live entry is still this exact session (guard against a restart race replacing it).
+    if (this.live.get(s.rec.key) === s) this.live.delete(s.rec.key);
     const note = s.rec.status === "closed" ? "🏁 session ended" : `💤 session detached (${esc(reason)}) — Resume with /sessions`;
     await this.say(s.rec, `<i>${note}</i>`);
   }

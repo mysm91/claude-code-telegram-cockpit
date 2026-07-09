@@ -434,6 +434,7 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
     const sess = rec && cockpit.live.get(rec.key);
     if (!sess) return void ctx.reply("No live managed session here.");
     sess.kill();
+    if (rec) cockpit.live.delete(rec.key); // don't let the dead session linger in `live` (finding #4)
     store.flushSessions();
     await ctx.reply("💀 Killed.");
   });
@@ -1073,7 +1074,7 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
     if (!rec) return void ctx.reply("No session bound here. /new to start one, /sessions to resume, /use to pick (flat mode).");
     if (rec.kind === "watch") return void ctx.reply("This is a watch-only mirror. Fork it (/sessions → Fork) to interact.");
     let sess = cockpit.live.get(rec.key);
-    if (!sess && rec.sessionId) {
+    if ((!sess || !sess.running) && rec.sessionId) { // also resume a dead-but-lingering session (finding #4)
       await ctx.reply("💤 Session was detached — resuming…");
       sess = await cockpit.spawn(rec, { resume: rec.sessionId });
     }
@@ -1085,8 +1086,8 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
     const rec = recOf(ctx);
     if (!rec) return void ctx.reply("No session here — /new or /sessions first.");
     let sess = cockpit.live.get(rec.key);
-    if (!sess && rec.kind === "managed" && rec.sessionId) {
-      // Same auto-resume as typed text: a detached session should accept photos too.
+    if ((!sess || !sess.running) && rec.kind === "managed" && rec.sessionId) {
+      // Same auto-resume as typed text: a detached (or dead-but-lingering) session should accept photos too.
       await ctx.reply("💤 Session was detached — resuming…");
       await cockpit.spawn(rec, { resume: rec.sessionId });
       sess = cockpit.live.get(rec.key);

@@ -26,6 +26,10 @@ export interface BridgeConfig {
   defaults: { model?: string; mode: string; effort?: string };
   /** Warn in Telegram when 5h window crosses this percentage. */
   usageWarnPct: number;
+  /** Auto-deny a managed permission/plan/question prompt if it goes unanswered for this many
+   *  minutes — a fail-safe so a never-tapped prompt (or a failed Telegram send) can't hang the
+   *  session forever. Tunable via bridge-state/config.json; default 15. */
+  approvalTimeoutMin?: number;
 }
 
 export const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url))); // project root (dist/..); fileURLToPath decodes %20/unicode so paths with spaces work
@@ -38,6 +42,7 @@ const DEFAULTS: BridgeConfig = {
   activeAccount: "claude-max",
   defaults: { mode: "default" },
   usageWarnPct: 90,
+  approvalTimeoutMin: 15,
 };
 
 export function loadConfig(): BridgeConfig {
