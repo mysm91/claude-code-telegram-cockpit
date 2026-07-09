@@ -608,12 +608,41 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
   });
 
   bot.command("file", async (ctx) => {
+    // Security: /file streams a file straight to Telegram, so it must be tightly confined —
+    // otherwise `/file /etc/passwd` or `/file ../../.ssh/id_rsa` would exfiltrate anything.
+    // Rules: a live session must be bound here; the arg is relative to that session's cwd;
+    // the realpath must stay inside the cwd (blocks `..` and symlink escapes); dotfiles and
+    // known secret/key files are refused; and there is a hard size cap.
     const rec = recOf(ctx);
+    const sess = rec && cockpit.live.get(rec.key);
+    if (!rec || !sess)
+      return void ctx.reply("No live session here. /file sends a file from a live session's working directory — start or resume one here first.");
     const arg = ctx.match?.trim();
-    if (!arg) return void ctx.reply("Usage: /file <path> (relative to the session cwd or absolute)");
-    const p = path.isAbsolute(arg) ? arg : path.join(rec?.cwd ?? process.cwd(), arg);
+    if (!arg) return void ctx.reply("Usage: /file <path> (relative to the session's working directory)");
+    if (path.isAbsolute(arg))
+      return void ctx.reply("⛔ Absolute paths aren't allowed. Give a path relative to the session directory.");
+    let cwdReal: string, real: string, st: fs.Stats;
     try {
-      await ctx.replyWithDocument(new InputFile(p), rec?.topicId ? { message_thread_id: rec.topicId } : {});
+      cwdReal = fs.realpathSync(rec.cwd);
+      real = fs.realpathSync(path.resolve(cwdReal, arg));
+    } catch {
+      return void ctx.reply("No such file in this session's directory.");
+    }
+    if (real !== cwdReal && !real.startsWith(cwdReal + path.sep))
+      return void ctx.reply("⛔ That path resolves outside the session directory — refused.");
+    try { st = fs.statSync(real); } catch { return void ctx.reply("Couldn't read that file."); }
+    if (!st.isFile()) return void ctx.reply("That's not a regular file.");
+    const relSegs = path.relative(cwdReal, real).split(path.sep);
+    if (relSegs.some((s) => s.startsWith(".")))
+      return void ctx.reply("⛔ Dotfiles (e.g. .env, .ssh, .git) can't be sent — they commonly hold secrets.");
+    const base = path.basename(real);
+    if (/(^id_(rsa|dsa|ecdsa|ed25519))|(\.(pem|key|p12|pfx|keystore|crt)$)|(credentials)|(secret)/i.test(base))
+      return void ctx.reply("⛔ That looks like a key/secret file — refused.");
+    const MAX_BYTES = 20 * 1024 * 1024;
+    if (st.size > MAX_BYTES)
+      return void ctx.reply(`File too large (${(st.size / 1048576).toFixed(1)} MB > 20 MB cap).`);
+    try {
+      await ctx.replyWithDocument(new InputFile(real), rec.topicId ? { message_thread_id: rec.topicId } : {});
     } catch (e) {
       await ctx.reply(`Couldn't send: ${e instanceof Error ? e.message : e}`);
     }
