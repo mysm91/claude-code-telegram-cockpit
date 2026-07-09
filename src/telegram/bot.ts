@@ -1094,10 +1094,15 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
     }
     if (!sess) return void ctx.reply("No live session here for the photo.");
     try {
+      const MAX_PHOTO = 15 * 1024 * 1024;
       const photo = ctx.message.photo[ctx.message.photo.length - 1];
       const f = await ctx.api.getFile(photo.file_id);
+      if (f.file_size && f.file_size > MAX_PHOTO) return void ctx.reply("That image is too large (>15 MB).");
       const url = `https://api.telegram.org/file/bot${token}/${f.file_path}`;
-      const buf = Buffer.from(await (await fetch(url)).arrayBuffer());
+      const resp = await fetch(url, { signal: AbortSignal.timeout(15_000) });
+      if (!resp.ok) return void ctx.reply(`Couldn't download the photo (HTTP ${resp.status}).`);
+      const buf = Buffer.from(await resp.arrayBuffer());
+      if (buf.length > MAX_PHOTO) return void ctx.reply("That image is too large (>15 MB).");
       sess.sendImage(buf.toString("base64"), "image/jpeg", ctx.message.caption);
       await ctx.reply("🖼 sent to Claude.");
     } catch (e) {

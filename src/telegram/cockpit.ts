@@ -336,11 +336,21 @@ export class Cockpit {
       const srcDir = path.join(configDirOf(source), "projects", enc);
       const dstDir = path.join(configDirOf(target), "projects", enc);
       const src = path.join(srcDir, `${rec.sessionId}.jsonl`);
-      if (fs.existsSync(src)) {
+      try {
+        if (!fs.existsSync(src)) throw new Error("source transcript not found");
         fs.mkdirSync(dstDir, { recursive: true });
         fs.copyFileSync(src, path.join(dstDir, `${rec.sessionId}.jsonl`));
         const sideSrc = path.join(srcDir, rec.sessionId); // tool-results / subagents sidecar dir
         if (fs.existsSync(sideSrc)) fs.cpSync(sideSrc, path.join(dstDir, rec.sessionId), { recursive: true, force: true });
+      } catch (e) {
+        // Copy failed → do NOT switch accounts: resuming on the target with a missing/partial
+        // transcript would lose history. Keep the session on its current account and resume it
+        // there so it isn't lost.
+        await this.say(rec, `⚠️ Couldn't copy this session's history to <b>${esc(target.name)}</b> (${esc(e instanceof Error ? e.message : String(e))}). Staying on <b>${esc(source.name)}</b>.`);
+        rec.status = "idle";
+        this.store.flushSessions();
+        await this.spawn(rec, { resume: rec.sessionId });
+        return;
       }
     }
     rec.account = target.name;
