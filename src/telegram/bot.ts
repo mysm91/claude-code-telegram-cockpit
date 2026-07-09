@@ -610,13 +610,12 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
   bot.command("file", async (ctx) => {
     // Security: /file streams a file straight to Telegram, so it must be tightly confined —
     // otherwise `/file /etc/passwd` or `/file ../../.ssh/id_rsa` would exfiltrate anything.
-    // Rules: a live session must be bound here; the arg is relative to that session's cwd;
-    // the realpath must stay inside the cwd (blocks `..` and symlink escapes); dotfiles and
-    // known secret/key files are refused; and there is a hard size cap.
+    // Rules: a session (with a working directory) must be bound here; the arg is relative to
+    // that session's cwd; the realpath must stay inside the cwd (blocks `..` and symlink
+    // escapes); dotfiles and known secret/key files are refused; and there is a hard size cap.
     const rec = recOf(ctx);
-    const sess = rec && cockpit.live.get(rec.key);
-    if (!rec || !sess)
-      return void ctx.reply("No live session here. /file sends a file from a live session's working directory — start or resume one here first.");
+    if (!rec?.cwd)
+      return void ctx.reply("No session bound here. /file sends a file from the bound session's working directory — open a session topic first.");
     const arg = ctx.match?.trim();
     if (!arg) return void ctx.reply("Usage: /file <path> (relative to the session's working directory)");
     if (path.isAbsolute(arg))
