@@ -44,7 +44,17 @@ export function ensureForeignState(): ForeignState {
  *  else. Also strips any legacy PreToolUse install of our hook (migration from the old design). */
 function setHook(install: boolean): void {
   let settings: Record<string, unknown> = {};
-  try { settings = JSON.parse(fs.readFileSync(SETTINGS, "utf8")); } catch { /* create fresh */ }
+  try {
+    settings = JSON.parse(fs.readFileSync(SETTINGS, "utf8"));
+  } catch (e) {
+    // CRITICAL: only create a fresh settings.json if it genuinely does not exist. If it
+    // exists but can't be read/parsed (transient I/O, partial write, momentary lock), we must
+    // NOT overwrite it — that would wipe the user's real permissions/statusLine/hooks/env.
+    if ((e as NodeJS.ErrnoException).code !== "ENOENT") {
+      console.error("foreignPerms: settings.json unreadable — refusing to modify it:", (e as Error).message);
+      return;
+    }
+  }
   type Entry = { matcher?: string; hooks: Array<Record<string, unknown>> };
   const hooks = (settings.hooks ?? {}) as Record<string, Entry[]>;
   const strip = (arr?: Entry[]): Entry[] =>
