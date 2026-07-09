@@ -14,6 +14,13 @@ import {
 import type { AccountCfg } from "../config.js";
 import type { SessionRec } from "../state.js";
 
+/** The SDK query() function, injectable for tests (the fake-SDK harness drives the session
+ *  lifecycle without the real SDK/network/quota). Production always uses the real query. */
+type QueryFn = typeof query;
+let _query: QueryFn = query;
+/** Test-only: swap in a fake query(); pass null to restore the real implementation. */
+export function __setQueryForTests(fn: QueryFn | null): void { _query = fn ?? query; }
+
 /** Push-based AsyncIterable used as the query() prompt stream. */
 class InputQueue implements AsyncIterable<SDKUserMessage> {
   private buf: SDKUserMessage[] = [];
@@ -126,7 +133,7 @@ export class ManagedSession {
   /** Start (or resume) the underlying query and pump its messages. */
   start(firstPrompt?: string, resume?: string): void {
     if (firstPrompt) this.send(firstPrompt);
-    this.q = query({ prompt: this.input, options: this.buildOptions(resume) });
+    this.q = _query({ prompt: this.input, options: this.buildOptions(resume) });
     this.running = true;
     void this.pump();
   }

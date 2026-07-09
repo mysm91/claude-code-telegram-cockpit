@@ -1,7 +1,7 @@
 {
   "name": "claude-code-telegram-cockpit",
   "version": "0.1.0",
-  "description": "Drive Claude Code from Telegram — sessions, permissions, plans, usage, and away-mode — 100% local on your own machine.",
+  "description": "Drive Claude Code from Telegram — sessions, permissions, plans, usage, and away-mode. Runs locally on your own machine (session content transits Telegram, so it is not end-to-end encrypted).",
   "type": "module",
   "license": "MIT",
   "author": "Meysam Shahrashoub (https://github.com/mysm91)",
@@ -12,7 +12,8 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/main.js",
-    "dev": "tsc && node dist/main.js"
+    "dev": "tsc && node dist/main.js",
+    "test": "tsc && node --test \"test/*.test.mjs\""
   },
   "keywords": [
     "claude-code",
