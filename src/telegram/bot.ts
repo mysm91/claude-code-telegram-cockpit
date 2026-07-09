@@ -539,6 +539,27 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
   bot.command("info", infoPanel);
   bot.command("status", infoPanel);
 
+  const healthPanel = async (ctx: Context): Promise<void> => {
+    const lines = ["<b>🩺 Health check</b>"];
+    try {
+      const { stdout } = await execFileP("claude", ["--version"], { timeout: 5000 });
+      lines.push(`✅ Claude CLI reachable — <code>${esc(stdout.trim())}</code>`);
+    } catch {
+      lines.push("❌ Claude CLI not reachable on PATH — new sessions can't start.");
+    }
+    const st = foreignState();
+    lines.push(st.enabled
+      ? `✅ Away-mode ON — perm server on 127.0.0.1:${st.port} (idle ≥ ${Math.round(st.idleSeconds / 60)}m)`
+      : "▫️ Away-mode off — perm server idle (/foreign on to enable).");
+    const connected = cfg.accounts.filter(accountConnected).map((a) => a.name);
+    lines.push(connected.length ? `✅ Accounts logged in — <code>${esc(connected.join(", "))}</code>` : "⚠️ No accounts logged in (see /account).");
+    lines.push(`✅ Paired — owner ${cfg.ownerId ? "set" : "unset"}, chat ${cfg.chatId ? "bound" : "unbound"}, ${cfg.forumMode ? "forum" : "flat"} mode`);
+    lines.push(`✅ Live managed sessions: ${cockpit.live.size}`);
+    await ctx.reply(lines.join("\n"), { parse_mode: "HTML" });
+  };
+  bot.command("health", healthPanel);
+  bot.command("doctor", healthPanel);
+
   bot.command("usage", async (ctx) => {
     // Dynamic list: only accounts actually logged in right now. Log one in later and it
     // appears here; log one out / remove it and it drops off — no static roster.
