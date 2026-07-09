@@ -20,11 +20,11 @@ export function watchTranscript(
       const st = fs.statSync(file);
       if (st.size < offset) offset = 0; // rotated/truncated
       if (st.size > offset) {
-        const fd = fs.openSync(file, "r");
         const len = st.size - offset;
         const b = Buffer.alloc(Math.min(len, 4 * 1024 * 1024));
-        const n = fs.readSync(fd, b, 0, b.length, offset);
-        fs.closeSync(fd);
+        const fd = fs.openSync(file, "r");
+        let n = 0;
+        try { n = fs.readSync(fd, b, 0, b.length, offset); } finally { fs.closeSync(fd); }
         offset += n;
         buf += b.toString("utf8", 0, n);
         const lines = buf.split("\n");

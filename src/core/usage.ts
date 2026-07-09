@@ -3,13 +3,24 @@
 //   2. Statusline snapshots dumped by statusline/collector.py (covers desktop/terminal
 //      sessions too — only if the statusLine is registered in ~/.claude/settings.json).
 //   3. The undocumented OAuth usage endpoint (per-account token from the Keychain).
+import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { HOME, STATE_DIR, keychain, type AccountCfg } from "../config.js";
 import type { RateInfo } from "./sessionManager.js";
 
-const CLAUDE_VERSION = "2.1.201"; // for the User-Agent the endpoint requires
+// The usage endpoint wants a claude-code User-Agent. Read the installed CLI's version once
+// (lazily, cached) instead of hardcoding it, so it doesn't drift after a Claude Code upgrade.
+let _claudeVersion: string | null = null;
+function claudeVersion(): string {
+  if (_claudeVersion) return _claudeVersion;
+  try {
+    const out = execFileSync("claude", ["--version"], { encoding: "utf8", timeout: 4000 });
+    _claudeVersion = out.match(/(\d+\.\d+\.\d+)/)?.[1] ?? "2.1.204";
+  } catch { _claudeVersion = "2.1.204"; }
+  return _claudeVersion;
+}
 
 export interface WindowUsage { pct?: number; resetsAt?: number; source: string; at: number }
 /** needsReauth = the account's access token is present but the API rejected it (401); it must be
@@ -86,7 +97,7 @@ async function oauthUsage(a: AccountCfg, attempt = 0): Promise<AccountUsage> {
       headers: {
         Authorization: `Bearer ${token}`,
         "anthropic-beta": "oauth-2025-04-20",
-        "User-Agent": `claude-code/${CLAUDE_VERSION}`,
+        "User-Agent": `claude-code/${claudeVersion()}`,
       },
       signal: AbortSignal.timeout(10_000),
     });
@@ -168,11 +179,10 @@ export async function accountUsage(a: AccountCfg): Promise<AccountUsage> {
 export function transcriptContextPct(file: string): { pct: number; model: string } | null {
   try {
     const st = fs.statSync(file);
-    const fd = fs.openSync(file, "r");
     const len = Math.min(st.size, 512 * 1024);
     const buf = Buffer.alloc(len);
-    fs.readSync(fd, buf, 0, len, st.size - len);
-    fs.closeSync(fd);
+    const fd = fs.openSync(file, "r");
+    try { fs.readSync(fd, buf, 0, len, st.size - len); } finally { fs.closeSync(fd); }
     const lines = buf.toString("utf8").split("\n").reverse();
     for (const line of lines) {
       try {

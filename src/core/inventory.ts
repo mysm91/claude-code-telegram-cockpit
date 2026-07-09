@@ -155,10 +155,10 @@ export function sessionMeta(file: string): { cwd: string | null; firstPrompt: st
   if (hit) return hit;
   const meta: { cwd: string | null; firstPrompt: string | null } = { cwd: null, firstPrompt: null };
   try {
-    const fd = fs.openSync(file, "r");
     const buf = Buffer.alloc(1024 * 1024);
-    const n = fs.readSync(fd, buf, 0, buf.length, 0);
-    fs.closeSync(fd);
+    const fd = fs.openSync(file, "r");
+    let n = 0;
+    try { n = fs.readSync(fd, buf, 0, buf.length, 0); } finally { fs.closeSync(fd); }
     for (const line of buf.toString("utf8", 0, n).split("\n")) {
       if (!line.includes('"cwd"') && !line.includes('"user"')) continue;
       try {
@@ -181,10 +181,9 @@ export function sessionTail(file: string, maxChars = 1400): { lastUser?: string;
   try {
     const st = fs.statSync(file);
     const len = Math.min(st.size, 1024 * 1024);
-    const fd = fs.openSync(file, "r");
     const buf = Buffer.alloc(len);
-    fs.readSync(fd, buf, 0, len, st.size - len);
-    fs.closeSync(fd);
+    const fd = fs.openSync(file, "r");
+    try { fs.readSync(fd, buf, 0, len, st.size - len); } finally { fs.closeSync(fd); }
     const lines = buf.toString("utf8", 0, len).split("\n");
     if (st.size > len) lines.shift(); // first line is partial
     const textOf = (c: unknown): string =>

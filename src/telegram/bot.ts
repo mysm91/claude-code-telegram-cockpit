@@ -115,7 +115,7 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
 
   // ---- helpers ----
   async function startSession(cwd: string, firstPrompt?: string, opts: Partial<SessionRec> = {}): Promise<SessionRec | null> {
-    if (!fs.existsSync(cwd)) return null;
+    try { if (!fs.statSync(cwd).isDirectory()) return null; } catch { return null; }
     const rec: SessionRec = {
       key: store.newKey(),
       cwd,
