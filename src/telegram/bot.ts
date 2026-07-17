@@ -15,7 +15,7 @@ import { startPermServer } from "../core/permServer.js";
 import { accountConnected, accountUsage, transcriptContextPct } from "../core/usage.js";
 import type { SessionRec, Store } from "../state.js";
 import { Cockpit } from "./cockpit.js";
-import { esc, fmtAgo, fmtPct, fmtReset, fmtTokens, mdToHtml } from "./render.js";
+import { chunk, esc, fmtAgo, fmtPct, fmtReset, fmtTokens, mdToHtml } from "./render.js";
 
 const execFileP = promisify(execFile);
 // Same naming as Claude Code's own mode menu ("default" is what the desktop calls "Ask permissions").
@@ -119,9 +119,17 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
 
   const recOf = (ctx: Context): SessionRec | undefined => {
     const tid = (ctx.message ?? ctx.callbackQuery?.message)?.message_thread_id;
-    if (cfg.forumMode && tid) return store.byTopic(tid);
-    if (activeKey) return store.sessions.get(activeKey);
-    return undefined;
+    // Forum mode: a command acts ONLY on the session whose topic it was sent in. In the General
+    // topic (no thread id) it binds nothing — never fall back to the last-active session, so a
+    // destructive command typed in General can't hit an unrelated session. Flat mode has no
+    // topics, so it uses the /use-selected active session.
+    if (cfg.forumMode) return tid ? store.byTopic(tid) : undefined;
+    return activeKey ? store.sessions.get(activeKey) : undefined;
+  };
+
+  /** Reply, chunked, so long HTML output never trips Telegram's 4096-char cap. */
+  const replyC = async (ctx: Context, html: string, extra: Record<string, unknown> = {}): Promise<void> => {
+    for (const piece of chunk(html)) await ctx.reply(piece, { parse_mode: "HTML", ...extra }).catch(() => undefined);
   };
 
   // ---- middleware: pairing + allowlist ----
@@ -670,7 +678,7 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
     lines.push("", "<b>Session</b>");
     lines.push(`<code>${esc(rec.cwd)}</code>`);
     lines.push(rec.sessionId ? `<code>${esc(rec.sessionId)}</code>` : "<i>session id pending first reply</i>");
-    await ctx.reply(lines.join("\n"), { parse_mode: "HTML" });
+    await replyC(ctx, lines.join("\n"));
   };
   bot.command("info", infoPanel);
   bot.command("status", infoPanel);
@@ -691,7 +699,7 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
     lines.push(connected.length ? `✅ Accounts logged in — <code>${esc(connected.join(", "))}</code>` : "⚠️ No accounts logged in (see /account).");
     lines.push(`✅ Paired — owner ${cfg.ownerId ? "set" : "unset"}, chat ${cfg.chatId ? "bound" : "unbound"}, ${cfg.forumMode ? "forum" : "flat"} mode`);
     lines.push(`✅ Live managed sessions: ${cockpit.live.size}`);
-    await ctx.reply(lines.join("\n"), { parse_mode: "HTML" });
+    await replyC(ctx, lines.join("\n"));
   };
   bot.command("health", healthPanel);
   bot.command("doctor", healthPanel);
@@ -714,7 +722,7 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
     }
     if (!connected.length) lines.push("\n<i>No accounts connected. Log one in on the Mac (see /account).</i>");
     if (dormant.length) lines.push(`\n<i>Not connected: ${dormant.map((a) => esc(a.name)).join(", ")} — run its login on the Mac to include it.</i>`);
-    await ctx.reply(lines.join("\n"), { parse_mode: "HTML" });
+    await replyC(ctx, lines.join("\n"));
   });
 
   bot.command("routines", async (ctx) => {
@@ -804,7 +812,7 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
     }
     const desktop = desktopGroupNames();
     if (desktop.length) lines.push(`\n<b>Desktop groups</b> <i>(read-only, from last sync snapshot — approximate)</i>\n${desktop.map((n) => `· ${esc(n)}`).join("\n")}`);
-    await ctx.reply(lines.join("\n"), { parse_mode: "HTML" });
+    await replyC(ctx, lines.join("\n"));
   });
 
   bot.command("group", async (ctx) => {

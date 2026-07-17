@@ -3,8 +3,11 @@
 import fs from "node:fs";
 import path from "node:path";
 import { botToken, loadConfig, STATE_DIR } from "./config.js";
+import { installRedactedConsole } from "./core/log.js";
 import { Store } from "./state.js";
 import { createBot } from "./telegram/bot.js";
+
+installRedactedConsole(); // scrub secrets + home paths from every log line
 
 fs.mkdirSync(path.join(STATE_DIR, "status"), { recursive: true, mode: 0o700 });
 fs.mkdirSync(path.join(STATE_DIR, "logs"), { recursive: true, mode: 0o700 });
