@@ -95,6 +95,25 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
   const awaiting = new Map<string, Awaiting>(); // threadKey -> pending input
   let lastList: LocalSession[] = [];
 
+  // Opaque callback refs (review finding #6): callback_data must never carry a bare index into a
+  // mutable module-level array — those arrays are rebuilt on every /sessions//new//plans, so a
+  // stale button would act on whatever now sits at that index (including the SIGKILL path).
+  // Buttons carry a short random ref that resolves to the stable identity (session id / path);
+  // handlers re-look the target up in CURRENT state and refuse when it's gone. 30-min TTL.
+  const refs = new Map<string, { kind: string; val: string; at: number }>();
+  const REF_TTL_MS = 30 * 60_000;
+  function putRef(kind: string, val: string): string {
+    if (refs.size > 4000) { const now = Date.now(); for (const [k, r] of refs) if (now - r.at > REF_TTL_MS) refs.delete(k); }
+    const id = randomBytes(4).toString("base64url"); // 6 chars; alphabet has no ':' so split() stays safe
+    refs.set(id, { kind, val, at: Date.now() });
+    return id;
+  }
+  function getRef(kind: string, id: string | undefined): string | null {
+    const r = id ? refs.get(id) : undefined;
+    if (!r || r.kind !== kind || Date.now() - r.at > REF_TTL_MS) return null;
+    return r.val;
+  }
+
   const threadKey = (ctx: Context): string => `${ctx.chat?.id}:${(ctx.message ?? ctx.callbackQuery?.message)?.message_thread_id ?? 0}`;
 
   const recOf = (ctx: Context): SessionRec | undefined => {
@@ -191,7 +210,7 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
     const start = page * DIRS_PER_PAGE;
     newDirs.slice(start, start + DIRS_PER_PAGE).forEach((d, i) => {
       const label = shortPath(d);
-      kb.text(label.length > 42 ? "…" + label.slice(-40) : label, `dir:${start + i}`).row();
+      kb.text(label.length > 42 ? "…" + label.slice(-40) : label, `dir:${putRef("dir", d)}`).row();
     });
     const pages = Math.max(1, Math.ceil(newDirs.length / DIRS_PER_PAGE));
     if (pages > 1) {
@@ -307,8 +326,8 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
   const projectsKb = (page: number): InlineKeyboard => {
     const kb = new InlineKeyboard();
     const start = page * PROJECTS_PER_PAGE;
-    projects.slice(start, start + PROJECTS_PER_PAGE).forEach((p, i) => {
-      kb.text(`${p.live ? "🟢" : "📁"} ${path.basename(p.folder)} · ${p.idxs.length} · ${fmtAgo(p.recent)}`, `proj:${start + i}`).row();
+    projects.slice(start, start + PROJECTS_PER_PAGE).forEach((p) => {
+      kb.text(`${p.live ? "🟢" : "📁"} ${path.basename(p.folder)} · ${p.idxs.length} · ${fmtAgo(p.recent)}`, `proj:${putRef("proj", p.folder)}`).row();
     });
     const pages = Math.max(1, Math.ceil(projects.length / PROJECTS_PER_PAGE));
     if (pages > 1) {
@@ -333,13 +352,13 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
       const s = lastList[gi];
       const name = s.title ?? path.basename(s.realCwd!);
       const mark = s.live ? "🟢" : s.archived ? "🗄" : "⚪️";
-      kb.text(`${mark} ${name.slice(0, 28)} · ${fmtAgo(s.mtime)}`, `sl:${gi}:m`).row();
+      kb.text(`${mark} ${name.slice(0, 28)} · ${fmtAgo(s.mtime)}`, `sl:${putRef("sess", s.sessionId)}:m`).row();
     });
     const pages = Math.max(1, Math.ceil(p.idxs.length / SESSIONS_PER_PAGE));
     if (pages > 1) {
-      if (page > 0) kb.text("« Prev", `ps:${pi}:${page - 1}`);
+      if (page > 0) kb.text("« Prev", `ps:${putRef("proj", p.folder)}:${page - 1}`);
       kb.text(`page ${page + 1}/${pages}`, "noop");
-      if (page < pages - 1) kb.text("Next »", `ps:${pi}:${page + 1}`);
+      if (page < pages - 1) kb.text("Next »", `ps:${putRef("proj", p.folder)}:${page + 1}`);
     }
     kb.text("« All projects", "projs");
     return kb;
@@ -380,6 +399,19 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
   const bridgeManaged = (sessionId: string): SessionRec | undefined =>
     [...store.sessions.values()].find((r) => r.kind === "managed" && r.sessionId === sessionId && r.status !== "closed");
 
+  // Fresh authoritative lookup by session id — used before any action that MUTATES state
+  // (resume / fork / close-on-Mac): a cached list entry's live/pid can be stale, and the
+  // close path signals a process (findings #6/#7). Also refreshes the browse cache.
+  async function findSessionFresh(sessionId: string): Promise<LocalSession | undefined> {
+    try {
+      const res = await listLocalSessions(cfg.accounts, 300);
+      lastList = res.sessions;
+      sessionsTotal = res.total;
+      buildProjects();
+      return res.sessions.find((s) => s.sessionId === sessionId);
+    } catch { return undefined; }
+  }
+
   async function resumeLocal(s: LocalSession, fork: boolean): Promise<void> {
     if (!fork) {
       // If this is one of OUR sessions, it already has a topic — reuse it (it being "live"
@@ -408,7 +440,7 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
     // If it was deleted/renamed since, offer to recreate it — history is in the transcript, not the folder.
     if (!fs.existsSync(cwd)) {
       const kb = new InlineKeyboard()
-        .text("📁 Recreate folder & resume", `mk:${lastList.indexOf(s)}:${Number(fork)}`).row()
+        .text("📁 Recreate folder & resume", `mk:${putRef("sess", s.sessionId)}:${Number(fork)}`).row()
         .text("Cancel", "sl:back");
       await cockpit.say(null,
         `⚠️ This session's folder no longer exists:\n<code>${esc(cwd)}</code>\n` +
@@ -512,8 +544,8 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
     const isCurrent = (m: { id: string; resolved?: string }): boolean =>
       m.id === rec.model || (!!m.resolved && m.resolved === rec.model);
     const kb = new InlineKeyboard();
-    models.slice(0, 12).forEach((m, i) => {
-      kb.text(`${isCurrent(m) ? "✓ " : ""}${modelVersion(m)}`, `md:${rec.key}:${i}`).row();
+    models.slice(0, 12).forEach((m) => {
+      kb.text(`${isCurrent(m) ? "✓ " : ""}${modelVersion(m)}`, `md:${rec.key}:${putRef("model", m.id)}`).row();
     });
     modelChoices.set(rec.key, models);
     const lines = models.map((m) => `${isCurrent(m) ? "✓" : "·"} <b>${esc(m.label)}</b> — <i>${esc(m.description || m.resolved || "")}</i>`);
@@ -638,11 +670,9 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
     const ps = listPlans();
     if (!ps.length) return void ctx.reply("No plan files.");
     const kb = new InlineKeyboard();
-    ps.forEach((p, i) => kb.text(p.name.slice(0, 50), `pf:${i}`).row());
-    planFiles = ps.map((p) => p.file);
+    ps.forEach((p) => kb.text(p.name.slice(0, 50), `pf:${putRef("plan", p.file)}`).row());
     await ctx.reply("Recent plan files (tap to receive as file):", { reply_markup: kb });
   });
-  let planFiles: string[] = [];
 
   bot.command("plan", async (ctx) => {
     const rec = recOf(ctx);
@@ -881,11 +911,12 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
       return void done();
     }
     if (head === "dir") {
-      const dir = newDirs[Number(rest[0])];
+      const dir = getRef("dir", rest[0]);
+      if (!dir) { await ctx.editMessageText("That picker expired — run /new again.").catch(() => undefined); return void done(); }
       awaiting.delete(threadKey(ctx));
-      await ctx.editMessageText(`Directory → <code>${esc(dir ?? "?")}</code> ✅`, { parse_mode: "HTML" }).catch(() => undefined);
+      await ctx.editMessageText(`Directory → <code>${esc(dir)}</code> ✅`, { parse_mode: "HTML" }).catch(() => undefined);
       await done();
-      if (dir) await startSession(dir);
+      await startSession(dir);
       return;
     }
     if (head === "noop") return void done();
@@ -909,8 +940,9 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
       return void done();
     }
     if (head === "mk") { // recreate a missing session folder, then resume/fork
-      const s = lastList[Number(rest[0])];
-      if (!s) return void done("Run /sessions again.");
+      const sid = getRef("sess", rest[0]);
+      const s = sid ? await findSessionFresh(sid) : undefined;
+      if (!s) return void done("Expired — run /sessions again.");
       const cwd = sessionCwd(s.file) ?? s.cwd;
       try { fs.mkdirSync(cwd, { recursive: true }); } catch { /* report below */ }
       await ctx.editMessageText(fs.existsSync(cwd) ? `📁 Recreated <code>${esc(cwd)}</code> — resuming…` : `⚠️ Couldn't create <code>${esc(cwd)}</code>`, { parse_mode: "HTML" }).catch(() => undefined);
@@ -927,15 +959,19 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
       await ctx.editMessageText(projectsText(), { parse_mode: "HTML", reply_markup: projectsKb(projectsPage) }).catch(() => undefined);
       return void done();
     }
-    if (head === "proj") { // open one project's sessions
-      curProject = Number(rest[0]); projSessPage = 0;
-      if (!projects[curProject]) return void done("Run /sessions again.");
-      await ctx.editMessageText(projSessText(curProject), { parse_mode: "HTML", reply_markup: projSessKb(curProject, 0) }).catch(() => undefined);
+    if (head === "proj") { // open one project's sessions (ref → folder path → current index)
+      const folder = getRef("proj", rest[0]);
+      const pi = folder ? projects.findIndex((p) => p.folder === folder) : -1;
+      if (pi < 0) return void done("Run /sessions again.");
+      curProject = pi; projSessPage = 0;
+      await ctx.editMessageText(projSessText(pi), { parse_mode: "HTML", reply_markup: projSessKb(pi, 0) }).catch(() => undefined);
       return void done();
     }
     if (head === "ps") { // sessions pagination within a project
-      const pi = Number(rest[0]); projSessPage = Number(rest[1]);
-      if (!projects[pi]) return void done();
+      const folder = getRef("proj", rest[0]);
+      const pi = folder ? projects.findIndex((p) => p.folder === folder) : -1;
+      if (pi < 0) return void done("Run /sessions again.");
+      projSessPage = Number(rest[1]);
       await ctx.editMessageText(projSessText(pi), { parse_mode: "HTML", reply_markup: projSessKb(pi, projSessPage) }).catch(() => undefined);
       return void done();
     }
@@ -945,10 +981,13 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
           await ctx.editMessageText(projSessText(curProject), { parse_mode: "HTML", reply_markup: projSessKb(curProject, projSessPage) }).catch(() => undefined);
       };
       if (rest[0] === "back") { await restoreList(); return void done(); }
-      const idx = Number(rest[0]);
-      const s = lastList[idx];
-      if (!s) return void done("Run /sessions again.");
+      const sid = getRef("sess", rest[0]);
+      if (!sid) return void done("These buttons expired — run /sessions again.");
+      // Menu/details/mirror may use the cached entry (identity-matched by session id, so a
+      // rebuilt list can't swap the target). Mutating actions re-resolve against fresh state below.
+      let s = lastList.find((x) => x.sessionId === sid);
       if (rest[1] === "m") {
+        if (!s) return void done("Run /sessions again.");
         // Update the message TEXT to the picked session, and show its actions.
         const mark = s.live ? "🟢 live now" : s.archived ? "🗄 archived" : "⚪️ resumable";
         const txt = `<b>${esc(s.title ?? path.basename(s.realCwd ?? s.cwd))}</b>\n` +
@@ -956,15 +995,15 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
           `${mark} · <i>${fmtAgo(s.mtime)}</i>\n\nChoose an action:`;
         const kb = new InlineKeyboard();
         if (bridgeManaged(s.sessionId)) {
-          kb.text("▶️ Go to its topic (open here)", `sl:${idx}:r`).row(); // our own live session
+          kb.text("▶️ Go to its topic (open here)", `sl:${rest[0]}:r`).row(); // our own live session
         } else if (s.live) {
-          kb.text("🛑 Close on Mac & continue here", `sl:${idx}:c`).row();
-          kb.text("🔀 Fork instead (leave it running)", `sl:${idx}:f`).row();
+          kb.text("🛑 Close on Mac & continue here", `sl:${rest[0]}:c`).row();
+          kb.text("🔀 Fork instead (leave it running)", `sl:${rest[0]}:f`).row();
         } else {
-          kb.text("▶️ Continue here", `sl:${idx}:r`).row();
+          kb.text("▶️ Continue here", `sl:${rest[0]}:r`).row();
         }
-        kb.text("👁 Mirror its output here", `sl:${idx}:w`).row();
-        kb.text("ℹ️ Details", `sl:${idx}:i`).row();
+        kb.text("👁 Mirror its output here", `sl:${rest[0]}:w`).row();
+        kb.text("ℹ️ Details", `sl:${rest[0]}:i`).row();
         kb.text("« Back", "sl:back");
         await ctx.editMessageText(txt, { parse_mode: "HTML", reply_markup: kb }).catch(() => undefined);
         return void done();
@@ -972,13 +1011,23 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
       // A real action: collapse the menu back to the project's session list first.
       await restoreList();
       await done();
+      // Resume/fork/close mutate state — never act on the cached snapshot's live/pid flags.
+      if (rest[1] === "r" || rest[1] === "f" || rest[1] === "c") s = await findSessionFresh(sid);
+      if (!s) { await cockpit.say(null, "That session is gone (or the list is stale) — run /sessions again."); return; }
       if (rest[1] === "r") await resumeLocal(s, false);
       else if (rest[1] === "f") await resumeLocal(s, true);
       else if (rest[1] === "c") {
-        // Close a stale foreign live session (open on the Mac/desktop) so it frees up to
-        // resume here. SIGTERM lets Claude Code flush + exit cleanly; escalate if needed.
+        // Close a stale foreign live session (open on the Mac/desktop) so it frees up to resume
+        // here. The pid comes from the FRESH re-read above (finding #7); before signaling, also
+        // verify the process still looks like a Claude session — never touch a recycled pid.
         const pid = s.pid;
-        if (!pid) { await cockpit.say(null, "Couldn't find its process id — try Mirror or Fork."); return; }
+        if (!s.live || !pid) { await cockpit.say(null, "It isn't live on the Mac anymore — run /sessions again and use Continue here."); return; }
+        let cmd = "";
+        try { cmd = (await execFileP("/bin/ps", ["-p", String(pid), "-o", "command="], { timeout: 4000 })).stdout.trim(); } catch { /* already gone */ }
+        if (cmd && !/claude/i.test(cmd)) {
+          await cockpit.say(null, `⚠️ pid ${pid} no longer looks like a Claude session (<code>${esc(cmd.slice(0, 80))}</code>) — not touching it. Run /sessions again.`);
+          return;
+        }
         const alive = (): boolean => { try { process.kill(pid, 0); return true; } catch { return false; } };
         try { process.kill(pid, "SIGTERM"); } catch { /* already gone */ }
         for (let i = 0; i < 12 && alive(); i++) await new Promise((r) => setTimeout(r, 500));
@@ -1061,17 +1110,18 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
       return void done();
     }
     if (head === "md") {
-      const [key, idx] = rest;
+      const [key, ref] = rest;
       const sess = cockpit.live.get(key);
       const rec2 = store.sessions.get(key);
-      const choice = modelChoices.get(key)?.[Number(idx)];
+      const modelId = getRef("model", ref);
+      const choice = modelId ? (modelChoices.get(key)?.find((m) => m.id === modelId) ?? { id: modelId, label: modelId, description: "" }) : undefined;
       if (choice && (sess || rec2)) {
         if (sess) await sess.setModel(choice.id);
         else if (rec2) rec2.model = choice.id;
         store.flushSessions();
         const suffix = sess ? "" : " <i>(applies when the session resumes)</i>";
         await ctx.editMessageText(`Model → <b>${esc(modelVersion(choice))}</b> ✅${suffix}`, { parse_mode: "HTML" }).catch(() => undefined);
-      } else await ctx.editMessageText("That session is gone — run /sessions.").catch(() => undefined);
+      } else await ctx.editMessageText("Expired or the session is gone — run /model again.").catch(() => undefined);
       return void done();
     }
     if (head === "sw") {
@@ -1103,9 +1153,10 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
       return void done();
     }
     if (head === "pf") {
-      const f = planFiles[Number(rest[0])];
+      const f = getRef("plan", rest[0]);
       await done();
-      if (f) await ctx.replyWithDocument(new InputFile(f)).catch(() => undefined);
+      if (f && fs.existsSync(f)) await ctx.replyWithDocument(new InputFile(f)).catch(() => undefined);
+      else await ctx.reply("That list expired (or the file is gone) — run /plans again.").catch(() => undefined);
       return;
     }
     await done();
