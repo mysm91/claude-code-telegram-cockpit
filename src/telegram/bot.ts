@@ -3,7 +3,7 @@
 import { autoRetry } from "@grammyjs/auto-retry";
 import { Bot, Context, InlineKeyboard, InputFile } from "grammy";
 import { execFile } from "node:child_process";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -461,11 +461,22 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
 
   // ---- Away-mode foreign-session permission relay (opt-in; default off) ----
   ensureForeignState();
-  const foreignAlways = new Set<string>(); // `${cwd}::${tool}` the owner said "always allow" to
+  // "Always allow" grants are scoped to the EXACT call — cwd + tool + a hash of the exact input
+  // (review finding #8): approving one benign Bash must never green-light every future Bash in
+  // that directory. Keys are canonical (object keys sorted) so an identical re-ask matches.
+  const stableStringify = (v: unknown): string => {
+    if (v === null || typeof v !== "object") return JSON.stringify(v) ?? "null";
+    if (Array.isArray(v)) return `[${v.map(stableStringify).join(",")}]`;
+    const o = v as Record<string, unknown>;
+    return `{${Object.keys(o).sort().map((k) => `${JSON.stringify(k)}:${stableStringify(o[k])}`).join(",")}}`;
+  };
+  const foreignKey = (cwd: string, tool: string, input: Record<string, unknown>): string =>
+    `${cwd}::${tool}::${createHash("sha256").update(stableStringify(input)).digest("hex").slice(0, 16)}`;
+  const foreignAlways = new Set<string>(); // foreignKey() values the owner said "always allow" to
   let pendingForeignRevise: string | null = null; // foreignApprovals id awaiting revision feedback
   startPermServer(foreignState().port, foreignState().token, async (req) => {
     if (bridgeManaged(req.sessionId)) return { decision: "ask" as const }; // our own session — canUseTool handles it
-    if (foreignAlways.has(`${req.cwd}::${req.tool}`)) return { decision: "allow" as const };
+    if (foreignAlways.has(foreignKey(req.cwd, req.tool, req.input))) return { decision: "allow" as const };
     return cockpit.askForeign(randomBytes(4).toString("hex"), req.tool, req.cwd, req.input, foreignState().waitSeconds * 1000);
   });
 
@@ -481,7 +492,11 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
         `✅ Away-mode <b>ON</b>. When you've been away from the Mac for <b>${thresh}</b>, permission prompts from desktop/terminal sessions come here with Allow/Deny. No answer in ~2 min → the prompt waits on the Mac. <code>/foreign off</code> to stop.`,
         { parse_mode: "HTML" });
     }
-    if (arg === "off") { disableForeign(); return void ctx.reply("🚫 Away-mode OFF. The global hook is removed — zero effect on your desktop sessions."); }
+    if (arg === "off") {
+      disableForeign();
+      foreignAlways.clear(); // standing grants must not survive an off→on cycle
+      return void ctx.reply("🚫 Away-mode OFF. The global hook is removed — zero effect on your desktop sessions. (Any \"always allow\" grants were cleared.)");
+    }
     await ctx.reply(
       `<b>Away-mode</b>: ${st.enabled ? "🟢 ON" : "⚪️ off"}\nIdle threshold: <b>${Math.round(st.idleSeconds / 60)} min</b>\n\n` +
       "Forwards permission prompts from sessions you started <i>outside</i> Telegram (desktop app / terminal) to your phone — but only while you're away from the Mac, and only for approval-worthy tools. Fails safe to the normal desktop prompt.\n\n" +
@@ -927,9 +942,9 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
       if (verb === "a") { fa.resolve({ decision: "allow" }); await ctx.editMessageText("✅ allowed once (foreign session)").catch(() => undefined); }
       else if (verb === "d") { fa.resolve({ decision: "deny", reason: "Denied by owner from phone." }); await ctx.editMessageText("❌ denied (foreign session)").catch(() => undefined); }
       else if (verb === "w") {
-        foreignAlways.add(`${fa.cwd}::${fa.tool}`);
+        foreignAlways.add(foreignKey(fa.cwd, fa.tool, fa.input));
         fa.resolve({ decision: "allow" });
-        await ctx.editMessageText(`♾ Always allowing <b>${esc(fa.tool)}</b> in this project while away.`, { parse_mode: "HTML" }).catch(() => undefined);
+        await ctx.editMessageText(`♾ Always allowing this <b>exact ${esc(fa.tool)} call</b> in this project while away (cleared on /foreign off or restart).`, { parse_mode: "HTML" }).catch(() => undefined);
       }
       else if (verb === "pa") { fa.resolve({ decision: "allow" }); await ctx.editMessageText("✅ plan approved (foreign session)").catch(() => undefined); }
       else if (verb === "px") { fa.resolve({ decision: "deny", reason: "Plan rejected by owner from phone. Stop and wait for new instructions." }); await ctx.editMessageText("❌ plan rejected (foreign session)").catch(() => undefined); }

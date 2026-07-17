@@ -23,8 +23,10 @@ export class Cockpit {
   live = new Map<string, ManagedSession>();
   watchers = new Map<string, WatchHandle>();
   approvals = new Map<string, PendingApproval>();
-  // Foreign-session permission/plan prompts awaiting a Telegram tap.
-  foreignApprovals = new Map<string, { resolve: (v: { decision: "allow" | "deny" | "ask"; reason?: string }) => void; messageId?: number; tool: string; cwd: string }>();
+  // Foreign-session permission/plan prompts awaiting a Telegram tap. `input` is kept so an
+  // "always allow" grant can be scoped to this exact call (cwd + tool + input hash), never
+  // to the whole tool.
+  foreignApprovals = new Map<string, { resolve: (v: { decision: "allow" | "deny" | "ask"; reason?: string }) => void; messageId?: number; tool: string; cwd: string; input: Record<string, unknown> }>();
   private drafts = new Map<string, Draft>();
   private toolBuf = new Map<string, string[]>();
   private warned5h = new Set<string>();
@@ -44,7 +46,7 @@ export class Cockpit {
   askForeign(id: string, tool: string, cwd: string, input: Record<string, unknown>, waitMs: number): Promise<{ decision: "allow" | "deny" | "ask"; reason?: string }> {
     return new Promise((resolve) => {
       const timer = setTimeout(() => { if (this.foreignApprovals.delete(id)) resolve({ decision: "ask" }); }, waitMs);
-      this.foreignApprovals.set(id, { tool, cwd, resolve: (v) => { clearTimeout(timer); this.foreignApprovals.delete(id); resolve(v); } });
+      this.foreignApprovals.set(id, { tool, cwd, input, resolve: (v) => { clearTimeout(timer); this.foreignApprovals.delete(id); resolve(v); } });
       const away = "<i>You're away from the Mac, so this came to your phone. No answer in ~2 min → it waits on the Mac.</i>";
       if (tool === "ExitPlanMode") {
         const plan = mdToHtml(String(input.plan ?? "(empty plan)")).slice(0, 3200);
@@ -58,7 +60,7 @@ export class Cockpit {
       const preview = JSON.stringify(input, null, 1).slice(0, 700);
       const kb = new InlineKeyboard()
         .text("✅ Allow once", `fp:${id}:a`).text("❌ Deny", `fp:${id}:d`).row()
-        .text(`♾ Always allow ${tool} here`, `fp:${id}:w`);
+        .text(`♾ Always allow this exact ${tool} call`, `fp:${id}:w`);
       void this.say(null,
         `🖥️ <b>Away-mode: a desktop/terminal session wants ${esc(tool)}</b>\n` +
         `<code>${esc(cwd)}</code>\n<pre><code>${esc(preview)}</code></pre>\n${away}`,
