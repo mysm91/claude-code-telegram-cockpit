@@ -1136,6 +1136,7 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
     { command: "sessions", description: "All local sessions (resume/fork/watch)" },
     { command: "info", description: "Full details: session, usage, limits, account" },
     { command: "usage", description: "5h + weekly limits per account" },
+    { command: "health", description: "Self-check: CLI, away-mode, accounts, pairing" },
     { command: "model", description: "Switch model" },
     { command: "mode", description: "Switch permission mode" },
     { command: "effort", description: "Switch effort level" },
