@@ -1,10 +1,10 @@
 // Cockpit: owns live sessions/watchers and renders their events into Telegram.
 import type { Api } from "grammy";
-import { InlineKeyboard } from "grammy";
+import { InlineKeyboard, InputFile } from "grammy";
 import fs from "node:fs";
 import path from "node:path";
 import { BridgeConfig, saveConfig, type AccountCfg } from "../config.js";
-import { configDirOf } from "../core/inventory.js";
+import { confinedFile, configDirOf } from "../core/inventory.js";
 import { ManagedSession, type PendingApproval, type RateInfo } from "../core/sessionManager.js";
 import { watchTranscript, type WatchHandle } from "../core/observer.js";
 import { accountUsage, noteRateEvent } from "../core/usage.js";
@@ -29,6 +29,7 @@ export class Cockpit {
   foreignApprovals = new Map<string, { resolve: (v: { decision: "allow" | "deny" | "ask"; reason?: string }) => void; messageId?: number; tool: string; cwd: string; input: Record<string, unknown> }>();
   private drafts = new Map<string, Draft>();
   private toolBuf = new Map<string, string[]>();
+  private writtenFiles = new Map<string, string[]>(); // key -> file_paths a session wrote this turn
   private warned5h = new Set<string>();
 
   constructor(api: Api, cfg: BridgeConfig, store: Store) {
@@ -39,6 +40,36 @@ export class Cockpit {
 
   account(name: string): AccountCfg {
     return this.cfg.accounts.find((a) => a.name === name) ?? this.cfg.accounts[0];
+  }
+
+  /** One-line human status of a managed session — what is it actually doing right now, so you
+   *  know whether to wait, answer something, or send input. (Foreign/watch sessions can't be
+   *  introspected remotely; their status shows live/idle + the mirrored tail instead.) */
+  sessionStatus(rec: SessionRec): string {
+    if (rec.kind === "watch") return "👁 mirroring a session running elsewhere — read-only (Fork it to interact)";
+    const sess = this.live.get(rec.key);
+    const pend = [...this.approvals.values()].find((a) => a.sessionKey === rec.key);
+    if (pend) {
+      if (pend.kind === "plan") return "📋 waiting for you to review a plan — scroll up (or /plan)";
+      if (pend.kind === "question") return "❓ asking you a question — scroll up to answer";
+      return `🔐 asking permission to use <b>${esc(pend.toolName)}</b> — scroll up: Allow / Deny`;
+    }
+    if (sess) {
+      if (sess.turnActive || rec.status === "running") return "🟢 working now… (I'll stream the reply here)";
+      if (rec.status === "idle") {
+        if (sess.lastResult?.isError) return `⛔ last turn ended with an error (<code>${esc(sess.lastResult.subtype || "error")}</code>) — send a message to retry`;
+        return "💬 done — waiting for your next message";
+      }
+    }
+    const r = rec.exitReason ?? "";
+    if (rec.status === "detached") {
+      if (/rate|limit|usage|quota/i.test(r)) return "⛔ stopped — usage limit hit. Switch account (/account) or wait for the reset, then send a message to resume.";
+      if (/401|auth|login|oauth/i.test(r)) return "⛔ stopped — sign-in problem; this account needs re-login (/login). Then send a message to resume.";
+      if (r && r !== "finished") return `⛔ stopped: <code>${esc(r.slice(0, 120))}</code> — send a message to resume.`;
+      return "💤 detached — not running here now. Send a message (or Resume from /sessions) to continue.";
+    }
+    if (rec.status === "closed") return "🏁 ended — Resume from /sessions to continue the conversation.";
+    return "💤 not running here.";
   }
 
   /** Ask the owner (via Telegram) to decide a permission or plan from a FOREIGN (desktop/
@@ -171,6 +202,12 @@ export class Cockpit {
 
   private renderTool(s: ManagedSession, name: string, input: Record<string, unknown>): void {
     const key = s.rec.key;
+    // Remember files this session writes this turn, to auto-surface them when the turn ends.
+    if (/^(Write|Edit|MultiEdit|NotebookEdit)$/.test(name) && typeof input.file_path === "string") {
+      const list = this.writtenFiles.get(key) ?? [];
+      if (!list.includes(input.file_path)) list.push(input.file_path);
+      this.writtenFiles.set(key, list);
+    }
     const buf = this.toolBuf.get(key) ?? [];
     buf.push(toolLine(name, input));
     this.toolBuf.set(key, buf);
@@ -286,6 +323,31 @@ export class Cockpit {
       lines.push("5-hour pool is full — move this conversation to another account:");
     }
     await this.say(s.rec, `<i>${lines.join("\n")}</i>`, kb);
+    await this.flushWrittenFiles(s.rec);
+  }
+
+  /** After a turn, auto-send the files the session wrote (so you SEE its outputs) — images as
+   *  photos, everything else as documents. Uses the same strict confinement as /file, so a file
+   *  outside the cwd, a dotfile, a secret/key, or an oversized file is skipped silently (still
+   *  fetchable via /file). Capped so a turn that writes many files can't flood the chat. */
+  private async flushWrittenFiles(rec: SessionRec): Promise<void> {
+    const files = this.writtenFiles.get(rec.key);
+    this.writtenFiles.delete(rec.key);
+    if (!files?.length || !this.cfg.chatId) return;
+    const MAX_AUTO = 5;
+    const extra = rec.topicId ? { message_thread_id: rec.topicId } : {};
+    let sent = 0;
+    for (const fp of files) {
+      if (sent >= MAX_AUTO) { await this.say(rec, `<i>…and ${files.length - sent} more file(s) written — <code>/file &lt;path&gt;</code> to fetch.</i>`); break; }
+      const res = confinedFile(rec.cwd, path.relative(rec.cwd, fp), 10 * 1024 * 1024);
+      if ("error" in res) continue; // outside cwd / secret / too big / already gone → skip
+      const caption = `📄 ${esc(path.basename(res.real))}`;
+      try {
+        if (res.isImage) await this.api.sendPhoto(this.cfg.chatId, new InputFile(res.real), { caption, ...extra });
+        else await this.api.sendDocument(this.cfg.chatId, new InputFile(res.real), { caption, ...extra });
+        sent++;
+      } catch { /* best-effort — the tool line already noted the write */ }
+    }
   }
 
   private async renderRate(s: ManagedSession, info: RateInfo): Promise<void> {

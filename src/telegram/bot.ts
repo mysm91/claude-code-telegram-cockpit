@@ -9,7 +9,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { BridgeConfig, saveConfig, STATE_DIR } from "../config.js";
 import { addToGroup, desktopGroupNames, removeFromGroup } from "../core/groups.js";
-import { configDirOf, listLocalSessions, listPlans, listRoutines, sessionCwd, sessionMeta, sessionTail, sessionTasks, type LocalSession } from "../core/inventory.js";
+import { confinedFile, configDirOf, listLocalSessions, listPlans, listRoutines, sessionCwd, sessionMeta, sessionTail, sessionTasks, type LocalSession } from "../core/inventory.js";
 import { disableForeign, enableForeign, ensureForeignState, foreignState } from "../core/foreignPerms.js";
 import { startPermServer } from "../core/permServer.js";
 import { accountConnected, accountUsage, transcriptContextPct } from "../core/usage.js";
@@ -579,13 +579,11 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
     const enc = rec.cwd.replace(/[^a-zA-Z0-9]/g, "-");
     const projDir = path.join(configDirOf(acct), "projects", enc);
 
-    const dot = rec.status === "running" ? "🟢" : rec.status === "watching" ? "👁" : rec.status === "idle" ? "🟡" : "⚪️";
     const lines: string[] = [
       `📟 <b>${esc(rec.title ?? path.basename(rec.cwd))}</b>`,
-      `<i>${dot} ${rec.status} · ${rec.kind} · started ${fmtAgo(rec.createdAt)} · last activity ${fmtAgo(rec.lastActivityAt)}</i>`,
+      cockpit.sessionStatus(rec),
+      `<i>${rec.kind} · started ${fmtAgo(rec.createdAt)} · last activity ${fmtAgo(rec.lastActivityAt)}</i>`,
     ];
-    const pend = [...cockpit.approvals.values()].filter((a) => a.sessionKey === rec.key).length;
-    if (pend) lines.push(`⚠️ <b>${pend} pending permission prompt${pend > 1 ? "s" : ""}</b> — scroll up to answer`);
     const taskLines = rec.sessionId ? sessionTasks(rec.sessionId, projDir) : [];
     if (taskLines.length) lines.push(`⚙️ ${taskLines.length} background item${taskLines.length > 1 ? "s" : ""} (/tasks)`);
     if (sess?.lastPlan) lines.push("📋 plan available (/plan)");
@@ -730,30 +728,12 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
       return void ctx.reply("No session bound here. /file sends a file from the bound session's working directory — open a session topic first.");
     const arg = ctx.match?.trim();
     if (!arg) return void ctx.reply("Usage: /file <path> (relative to the session's working directory)");
-    if (path.isAbsolute(arg))
-      return void ctx.reply("⛔ Absolute paths aren't allowed. Give a path relative to the session directory.");
-    let cwdReal: string, real: string, st: fs.Stats;
+    const res = confinedFile(rec.cwd, arg); // shared strict confinement (see inventory.ts)
+    if ("error" in res) return void ctx.reply(`⛔ ${res.error}`);
     try {
-      cwdReal = fs.realpathSync(rec.cwd);
-      real = fs.realpathSync(path.resolve(cwdReal, arg));
-    } catch {
-      return void ctx.reply("No such file in this session's directory.");
-    }
-    if (real !== cwdReal && !real.startsWith(cwdReal + path.sep))
-      return void ctx.reply("⛔ That path resolves outside the session directory — refused.");
-    try { st = fs.statSync(real); } catch { return void ctx.reply("Couldn't read that file."); }
-    if (!st.isFile()) return void ctx.reply("That's not a regular file.");
-    const relSegs = path.relative(cwdReal, real).split(path.sep);
-    if (relSegs.some((s) => s.startsWith(".")))
-      return void ctx.reply("⛔ Dotfiles (e.g. .env, .ssh, .git) can't be sent — they commonly hold secrets.");
-    const base = path.basename(real);
-    if (/(^id_(rsa|dsa|ecdsa|ed25519))|(\.(pem|key|p12|pfx|keystore|crt)$)|(credentials)|(secret)/i.test(base))
-      return void ctx.reply("⛔ That looks like a key/secret file — refused.");
-    const MAX_BYTES = 20 * 1024 * 1024;
-    if (st.size > MAX_BYTES)
-      return void ctx.reply(`File too large (${(st.size / 1048576).toFixed(1)} MB > 20 MB cap).`);
-    try {
-      await ctx.replyWithDocument(new InputFile(real), rec.topicId ? { message_thread_id: rec.topicId } : {});
+      const opts = rec.topicId ? { message_thread_id: rec.topicId } : {};
+      if (res.isImage) await ctx.replyWithPhoto(new InputFile(res.real), opts);
+      else await ctx.replyWithDocument(new InputFile(res.real), opts);
     } catch (e) {
       await ctx.reply(`Couldn't send: ${e instanceof Error ? e.message : e}`);
     }
@@ -1062,9 +1042,27 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
         await ctx.editMessageText(txt, { parse_mode: "HTML", reply_markup: kb }).catch(() => undefined);
         return void done();
       }
-      // A real action: collapse the menu back to the project's session list first.
-      await restoreList();
+      // A real action. Collapse the source menu to a summary (no stale buttons — the list/menu
+      // must not linger where you tapped) and then act.
+      const label = esc(s?.title ?? sid.slice(0, 8));
       await done();
+      if (rest[1] === "i") { // details are informational: show in place + the last reply, keep Back
+        const t = s ? transcriptContextPct(s.file) : null;
+        const tail = s ? sessionTail(s.file) : {};
+        const details = [
+          `ℹ️ <b>${label}</b>`,
+          `<code>${esc(s?.sessionId ?? sid)}</code>`,
+          s ? `cwd <code>${esc(sessionCwd(s.file) ?? s.cwd)}</code>` : "",
+          s ? `account <b>${esc(s.account)}</b> · ${s.live ? `🟢 live on the Mac (pid ${s.pid})` : `⚪️ idle — last active ${fmtAgo(s.mtime)}`} · ${(s.size / 1024).toFixed(0)}KB` : "",
+          t ? `context ~${fmtPct(t.pct)} · model ${esc(t.model)}` : "",
+          tail.lastAssistant ? `\n📖 <b>last reply</b>\n${mdToHtml(tail.lastAssistant).slice(0, 1200)}` : "",
+          s?.live ? `\n<i>Live on the Mac — I can't tell remotely whether it's mid-task or waiting on a prompt. Mirror it to watch its output, or open on the Mac: <code>open 'claude://resume?session=${esc(s.sessionId)}'</code></i>` : "",
+        ].filter(Boolean).join("\n");
+        await ctx.editMessageText(details, { parse_mode: "HTML", reply_markup: new InlineKeyboard().text("« Back to list", "sl:back") }).catch(() => undefined);
+        return;
+      }
+      const verbLabel = rest[1] === "r" ? "▶️ Continuing" : rest[1] === "f" ? "🔀 Forking" : rest[1] === "c" ? "🛑 Closing on the Mac & continuing" : "👁 Mirroring";
+      await ctx.editMessageText(`${verbLabel} <b>${label}</b> — opening its topic below…`, { parse_mode: "HTML" }).catch(() => undefined);
       // Resume/fork/close mutate state — never act on the cached snapshot's live/pid flags.
       if (rest[1] === "r" || rest[1] === "f" || rest[1] === "c") s = await findSessionFresh(sid);
       if (!s) { await cockpit.say(null, "That session is gone (or the list is stale) — run /sessions again."); return; }
@@ -1099,17 +1097,9 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
         };
         rec.topicId = await cockpit.makeTopic(rec.title!);
         await cockpit.watch(s.file, rec);
-        await cockpit.say(rec, `👁 Watching <b>${esc(s.title ?? s.sessionId.slice(0, 8))}</b> — new activity will mirror here. /unwatch to stop.\n<i>To type into it: open it on the Mac (it's live there) or Fork it here.</i>`);
-      } else if (rest[1] === "i") {
-        const t = transcriptContextPct(s.file);
-        await cockpit.say(null, [
-          `ℹ️ <b>${esc(s.title ?? s.sessionId)}</b>`,
-          `<code>${esc(s.sessionId)}</code>`,
-          `cwd <code>${esc(sessionCwd(s.file) ?? s.cwd)}</code>`,
-          `account <b>${esc(s.account)}</b> · ${s.live ? `🟢 live (pid ${s.pid})` : `⚪️ last active ${fmtAgo(s.mtime)}`} · ${(s.size / 1024).toFixed(0)}KB`,
-          t ? `context ~${fmtPct(t.pct)} · model ${esc(t.model)}` : "",
-          s.live ? `open on Mac: <code>open 'claude://resume?session=${esc(s.sessionId)}'</code>` : "",
-        ].filter(Boolean).join("\n"));
+        const liveNote = s.live ? "🟢 It's live on the Mac right now." : `⚪️ It's idle on the Mac (last active ${fmtAgo(s.mtime)}).`;
+        await cockpit.say(rec, `👁 <b>Mirroring ${esc(s.title ?? s.sessionId.slice(0, 8))}</b> — new activity appears here (read-only). /unwatch to stop.\n${liveNote}\n<i>A remote view can't tell "working" from "waiting on a prompt" — read the last output below to decide. To interact: Fork it here, or open it on the Mac.</i>`);
+        await postTail(rec, s.file);
       }
       return;
     }

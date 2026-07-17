@@ -10,6 +10,37 @@ import type { AccountCfg } from "../config.js";
 const execFileP = promisify(execFile);
 const HOME = os.homedir();
 
+const SECRET_FILE_RE = /(^id_(rsa|dsa|ecdsa|ed25519))|(\.(pem|key|p12|pfx|keystore|crt)$)|(credentials)|(secret)/i;
+const IMAGE_FILE_RE = /\.(png|jpe?g|gif|webp)$/i;
+
+/** Resolve `arg` strictly inside `cwd` for sending a file to Telegram — the single source of
+ *  truth for /file AND for auto-surfacing files a session writes. Rejects absolute paths, `..`
+ *  and symlink escapes (realpath must stay under cwd), dotfiles, known secret/key names, and
+ *  anything over the size cap. Returns the real path + metadata, or a human-readable error. */
+export function confinedFile(
+  cwd: string,
+  arg: string,
+  maxBytes = 20 * 1024 * 1024,
+): { real: string; size: number; isImage: boolean } | { error: string } {
+  if (path.isAbsolute(arg)) return { error: "Absolute paths aren't allowed. Give a path relative to the session directory." };
+  let cwdReal: string;
+  let real: string;
+  try {
+    cwdReal = fs.realpathSync(cwd);
+    real = fs.realpathSync(path.resolve(cwdReal, arg));
+  } catch {
+    return { error: "No such file in this session's directory." };
+  }
+  if (real !== cwdReal && !real.startsWith(cwdReal + path.sep)) return { error: "That path resolves outside the session directory — refused." };
+  let st: fs.Stats;
+  try { st = fs.statSync(real); } catch { return { error: "Couldn't read that file." }; }
+  if (!st.isFile()) return { error: "That's not a regular file." };
+  if (path.relative(cwdReal, real).split(path.sep).some((s) => s.startsWith("."))) return { error: "Dotfiles (e.g. .env, .ssh, .git) can't be sent — they commonly hold secrets." };
+  if (SECRET_FILE_RE.test(path.basename(real))) return { error: "That looks like a key/secret file — refused." };
+  if (st.size > maxBytes) return { error: `File too large (${(st.size / 1048576).toFixed(1)} MB > ${(maxBytes / 1048576).toFixed(0)} MB cap).` };
+  return { real, size: st.size, isImage: IMAGE_FILE_RE.test(real) };
+}
+
 export function configDirOf(a: AccountCfg): string {
   return a.configDir ?? path.join(HOME, ".claude");
 }

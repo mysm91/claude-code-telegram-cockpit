@@ -17,6 +17,9 @@ export interface SessionRec {
   kind: "managed" | "watch";
   createdAt: number;
   lastActivityAt: number;
+  /** Why the session last stopped/detached (SDK error message, "limit", auth, or "finished").
+   *  Survives the session leaving `cockpit.live`, so /info & /sessions can explain its state. */
+  exitReason?: string;
 }
 
 export interface Groups { [name: string]: { sessions: string[]; createdAt: number } }

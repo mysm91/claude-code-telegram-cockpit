@@ -96,6 +96,10 @@ export class ManagedSession {
   lastPlan = "";
   lastFinalText = "";
   running = false;
+  /** Last SDK result summary (for the /info + /sessions status line). */
+  lastResult: { isError: boolean; subtype: string } | null = null;
+  /** True while the model is mid-turn (between send and the next result). */
+  turnActive = false;
 
   constructor(rec: SessionRec, account: AccountCfg, events: SessionEvents) {
     this.rec = rec;
@@ -178,12 +182,16 @@ export class ManagedSession {
           }
           case "result": {
             this.rec.status = "idle";
-            this.events.onResult(this, {
+            this.turnActive = false;
+            const info = {
               costUsd: (m as { total_cost_usd?: number }).total_cost_usd,
               turns: (m as { num_turns?: number }).num_turns,
               isError: Boolean((m as { is_error?: boolean }).is_error),
               subtype: String((m as { subtype?: string }).subtype ?? ""),
-            });
+            };
+            this.lastResult = { isError: info.isError, subtype: info.subtype };
+            if (!info.isError) this.rec.exitReason = undefined; // a clean turn clears any prior error note
+            this.events.onResult(this, info);
             break;
           }
           case "rate_limit_event": {
@@ -208,12 +216,16 @@ export class ManagedSession {
         }
       }
       this.running = false;
+      this.turnActive = false;
       this.rec.status = "closed";
+      this.rec.exitReason = "finished";
       this.events.onExit(this, "finished");
     } catch (e) {
       this.running = false;
+      this.turnActive = false;
       this.rec.status = "detached";
       const msg = e instanceof Error ? e.message : String(e);
+      this.rec.exitReason = msg.slice(0, 300);
       if (/401|auth|login/i.test(msg)) {
         this.events.onNote(this, `⚠️ Session failed to authenticate (<code>${msg.slice(0, 200)}</code>).\nRun <code>claude auth login</code> on the Mac for account <b>${this.account.name}</b>, then Resume.`);
       }
@@ -251,11 +263,13 @@ export class ManagedSession {
 
   send(text: string): void {
     this.rec.status = "running";
+    this.turnActive = true;
     this.input.push({ type: "user", message: { role: "user", content: text }, parent_tool_use_id: null });
   }
 
   sendImage(base64: string, mediaType: string, caption?: string): void {
     this.rec.status = "running";
+    this.turnActive = true;
     const content: Array<Record<string, unknown>> = [
       { type: "image", source: { type: "base64", media_type: mediaType, data: base64 } },
     ];
