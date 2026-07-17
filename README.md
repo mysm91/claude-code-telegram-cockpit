@@ -134,6 +134,14 @@ defaults apply when a key is absent — add a key only to override it:
 `ownerId`, `chatId`, `accounts`, and `activeAccount` in the same file are managed by the daemon during
 pairing and normal use — you don't normally edit those by hand.
 
+**Pairing & re-pairing.** On first run the daemon prints a pairing code (also written to
+`~/.claude/bridge-state/pairing-code.txt`, mode 0600) — send it to the bot to become the owner. The code
+is 64-bit, expires after 15 minutes (a fresh one is issued on demand), and five wrong attempts trigger a
+15-minute lockout with rotation. Once paired, the bot's home chat is **pinned**: `/start` elsewhere won't
+move it — run `/bindchat` in the target chat and confirm. To re-pair from scratch (lost account, wrong
+owner), delete the `ownerId` and `chatId` keys from `~/.claude/bridge-state/config.json`, restart the
+daemon, and use the fresh code.
+
 ## Commands
 
 | Command | What it does |

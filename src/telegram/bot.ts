@@ -72,12 +72,24 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
   });
   const cockpit = new Cockpit(bot.api, cfg, store);
 
-  const pairingCode = cfg.ownerId ? null : randomBytes(3).toString("hex");
-  if (pairingCode) {
-    const msg = `claude-tg-bridge pairing code: ${pairingCode}  (send it to the bot in Telegram)`;
-    console.log(`\n=== ${msg} ===\n`);
-    fs.writeFileSync(path.join(STATE_DIR, "pairing-code.txt"), pairingCode + "\n");
+  // Pairing hardening (review finding #11): 64-bit code, 15-minute expiry with rotation,
+  // failed-attempt lockout, 0600 code file that is deleted once pairing succeeds.
+  const PAIR_TTL_MS = 15 * 60_000;
+  const PAIR_MAX_FAILS = 5;
+  const PAIR_LOCK_MS = 15 * 60_000;
+  const PAIR_FILE = path.join(STATE_DIR, "pairing-code.txt");
+  let pairingIssuedAt = 0;
+  let pairFails = 0;
+  let pairLockUntil = 0;
+  function issuePairingCode(): string {
+    pairingIssuedAt = Date.now();
+    const code = randomBytes(8).toString("base64url"); // 64 bits
+    console.log(`\n=== claude-tg-bridge pairing code: ${code}  (send it to the bot in Telegram; valid ${PAIR_TTL_MS / 60_000} min) ===\n`);
+    fs.writeFileSync(PAIR_FILE, code + "\n", { mode: 0o600 });
+    try { fs.chmodSync(PAIR_FILE, 0o600); } catch { /* best-effort on pre-existing file */ }
+    return code;
   }
+  let pairingCode = cfg.ownerId ? null : issuePairingCode();
 
   let activeKey: string | null = null; // flat-mode active session
   const awaiting = new Map<string, Awaiting>(); // threadKey -> pending input
@@ -96,14 +108,28 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
   bot.use(async (ctx, next) => {
     const uid = ctx.from?.id;
     if (!cfg.ownerId) {
-      if (ctx.message?.text?.trim() === pairingCode && uid) {
+      const text = ctx.message?.text?.trim();
+      if (!text || !uid) return; // unpaired: only text can pair; ignore everything else
+      const now = Date.now();
+      if (now < pairLockUntil) return; // lockout after repeated failures — drop silently
+      if (pairingCode && now - pairingIssuedAt > PAIR_TTL_MS) pairingCode = issuePairingCode(); // expired → rotate (old code dead)
+      if (pairingCode && text === pairingCode) {
         cfg.ownerId = uid;
         cfg.chatId = ctx.chat?.id;
+        if (ctx.chat?.type === "supergroup" && (ctx.chat as { is_forum?: boolean }).is_forum) cfg.forumMode = true;
         saveConfig(cfg);
+        pairingCode = null;
+        try { fs.unlinkSync(PAIR_FILE); } catch { /* already gone */ }
         await ctx.reply("🔗 Paired. This bot now answers only to you.\nUse /help to see what it can do, /new to start a session.");
         return;
       }
-      return; // unpaired: ignore everything else
+      if (++pairFails >= PAIR_MAX_FAILS) {
+        pairFails = 0;
+        pairLockUntil = now + PAIR_LOCK_MS;
+        pairingCode = issuePairingCode(); // rotate so a brute-forcer starts over after the lockout
+        console.log(`pairing: ${PAIR_MAX_FAILS} failed attempts — locked ${PAIR_LOCK_MS / 60_000} min, code rotated`);
+      }
+      return;
     }
     if (uid !== cfg.ownerId) {
       console.log(`dropped update from non-owner ${uid}`);
@@ -184,10 +210,28 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
 
   // ---- commands ----
   bot.command("start", async (ctx) => {
-    cfg.chatId = ctx.chat.id;
-    if (ctx.chat.type === "supergroup" && (ctx.chat as { is_forum?: boolean }).is_forum) cfg.forumMode = true;
-    saveConfig(cfg);
+    // chatId is pinned once bound (review finding #4): a stray /start in another chat must NOT
+    // silently repoint all output/prompts/files there. Moving is explicit via /bindchat.
+    if (cfg.chatId && ctx.chat.id !== cfg.chatId)
+      return void ctx.reply("👋 The cockpit is already bound to another chat. To move ALL output, prompts, and file payloads to THIS chat, run /bindchat here (asks for confirmation).");
+    if (!cfg.chatId) {
+      cfg.chatId = ctx.chat.id;
+      if (ctx.chat.type === "supergroup" && (ctx.chat as { is_forum?: boolean }).is_forum) cfg.forumMode = true;
+      saveConfig(cfg);
+    }
     await ctx.reply("👋 Cockpit online. /new to start a session, /sessions to browse, /help for everything.");
+  });
+
+  bot.command("bindchat", async (ctx) => {
+    if (cfg.chatId === ctx.chat.id) return void ctx.reply("This chat is already the cockpit's home.");
+    const isForum = ctx.chat.type === "supergroup" && Boolean((ctx.chat as { is_forum?: boolean }).is_forum);
+    const kb = new InlineKeyboard().text("⚠️ Yes — rebind to THIS chat", "bind:yes").row().text("Cancel", "bind:no");
+    await ctx.reply(
+      `⚠️ <b>Rebind the cockpit to this chat?</b>\nALL session output, permission prompts, and file payloads will move here${isForum ? " (forum mode: one topic per session)" : ""}.\n` +
+      `${isForum ? "" : "Prefer a private chat, or a private forum group you control.\n"}` +
+      `Currently bound chat id: <code>${cfg.chatId ?? "none"}</code>`,
+      { parse_mode: "HTML", reply_markup: kb },
+    );
   });
 
   bot.command("help", (ctx) =>
@@ -752,6 +796,20 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
     const done = (t?: string): Promise<unknown> => ctx.answerCallbackQuery(t ? { text: t } : undefined).catch(() => undefined);
     const [head, ...rest] = data.split(":");
 
+    if (head === "bind") {
+      if (rest[0] === "yes") {
+        const chat = ctx.callbackQuery.message?.chat;
+        if (!chat) return void done("Couldn't identify this chat.");
+        cfg.chatId = chat.id;
+        cfg.forumMode = chat.type === "supergroup" && Boolean((chat as { is_forum?: boolean }).is_forum);
+        saveConfig(cfg);
+        await ctx.editMessageText(`✅ Cockpit rebound to this chat (<code>${chat.id}</code>)${cfg.forumMode ? " — forum mode" : ""}.`, { parse_mode: "HTML" }).catch(() => undefined);
+      } else {
+        await ctx.editMessageText("Cancelled — binding unchanged.").catch(() => undefined);
+      }
+      return void done();
+    }
+
     if (head === "p" || head === "pl" || head === "q") {
       const [aid, verb] = rest;
       const a = cockpit.approvals.get(aid);
@@ -1137,6 +1195,7 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
     { command: "info", description: "Full details: session, usage, limits, account" },
     { command: "usage", description: "5h + weekly limits per account" },
     { command: "health", description: "Self-check: CLI, away-mode, accounts, pairing" },
+    { command: "bindchat", description: "Move the cockpit to THIS chat (confirmed)" },
     { command: "model", description: "Switch model" },
     { command: "mode", description: "Switch permission mode" },
     { command: "effort", description: "Switch effort level" },
