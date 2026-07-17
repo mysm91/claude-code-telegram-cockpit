@@ -211,13 +211,18 @@ export class Cockpit {
       return;
     }
     if (a.kind === "question") {
-      const q = (a.input.questions as Array<Record<string, unknown>> | undefined)?.[0];
-      const kb = new InlineKeyboard();
-      const opts = (q?.options as Array<{ label: string; description?: string }> | undefined) ?? [];
-      opts.forEach((o, i) => kb.text(o.label.slice(0, 60), `q:${a.id}:${i}`).row());
-      kb.text("✍️ Other…", `q:${a.id}:o`);
-      const lines = opts.map((o, i) => `${i + 1}. <b>${esc(o.label)}</b>${o.description ? ` — ${esc(o.description)}` : ""}`);
-      a.messageId = await this.say(s.rec, `❓ <b>${esc(String(q?.question ?? "Claude asks:"))}</b>\n\n${lines.join("\n")}`, kb);
+      // AskUserQuestion carries 1–4 questions, each single- or multi-select (finding #12: all of
+      // them must be asked, not just the first). Text lists every question; the keyboard is built
+      // by questionKb so the tap handler can re-render toggle state on the same message.
+      const questions = (a.input.questions as Array<Record<string, unknown>> | undefined) ?? [];
+      const blocks = questions.map((q, qi) => {
+        const opts = (q.options as Array<{ label: string; description?: string }> | undefined) ?? [];
+        const lines = opts.map((o, i) => `  ${i + 1}. <b>${esc(o.label)}</b>${o.description ? ` — ${esc(o.description)}` : ""}`);
+        const tag = q.multiSelect ? " <i>(select all that apply, then Submit)</i>" : "";
+        return `${questions.length > 1 ? `${qi + 1}️⃣ ` : ""}<b>${esc(String(q.question ?? "Claude asks:"))}</b>${tag}\n${lines.join("\n")}`;
+      });
+      const head = questions.length > 1 ? `❓ <b>Claude asks ${questions.length} questions</b>\n\n` : "❓ ";
+      a.messageId = await this.say(s.rec, `${head}${blocks.join("\n\n")}`, this.questionKb(a, new Map()));
       guardDelivery();
       return;
     }
@@ -233,6 +238,27 @@ export class Cockpit {
       kb,
     );
     guardDelivery();
+  }
+
+  /** Inline keyboard for an AskUserQuestion approval. `sel` = current selections per question
+   *  index (a Set of picked option indices, or a free-text string from "Other"). A single
+   *  single-select question answers on first tap (no Submit); anything else toggles + submits. */
+  questionKb(a: PendingApproval, sel: Map<number, Set<number> | string>): InlineKeyboard {
+    const questions = (a.input.questions as Array<Record<string, unknown>> | undefined) ?? [];
+    const kb = new InlineKeyboard();
+    const instant = questions.length === 1 && !questions[0]?.multiSelect;
+    questions.forEach((q, qi) => {
+      const opts = (q.options as Array<{ label: string }> | undefined) ?? [];
+      const picked = sel.get(qi);
+      opts.forEach((o, oi) => {
+        const on = picked instanceof Set && picked.has(oi);
+        const prefix = instant ? "" : on ? "✅ " : "▫️ ";
+        kb.text(`${questions.length > 1 ? `${qi + 1}. ` : ""}${prefix}${o.label.slice(0, 48)}`, `q:${a.id}:${qi}:${oi}`).row();
+      });
+      kb.text(`${typeof picked === "string" ? "✅ " : ""}✍️ Other${questions.length > 1 ? ` (Q${qi + 1})` : "…"}`, `q:${a.id}:${qi}:o`).row();
+    });
+    if (!instant) kb.text("📨 Submit answers", `q:${a.id}:submit`);
+    return kb;
   }
 
   private async renderResult(s: ManagedSession, info: { costUsd?: number; turns?: number; isError: boolean; subtype: string }): Promise<void> {

@@ -46,7 +46,7 @@ const shortPath = (p: string): string => p.replace(/^\/Users\//, "");
 type Awaiting =
   | { type: "dir" }
   | { type: "planFeedback"; aid: string }
-  | { type: "questionOther"; aid: string };
+  | { type: "questionOther"; aid: string; qIdx: number };
 
 export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot: Bot; cockpit: Cockpit } {
   const bot = new Bot(token);
@@ -93,6 +93,7 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
 
   let activeKey: string | null = null; // flat-mode active session
   const awaiting = new Map<string, Awaiting>(); // threadKey -> pending input
+  const qState = new Map<string, Map<number, Set<number> | string>>(); // AskUserQuestion selections per approval id
   let lastList: LocalSession[] = [];
 
   // Opaque callback refs (review finding #6): callback_data must never carry a bare index into a
@@ -858,7 +859,7 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
     if (head === "p" || head === "pl" || head === "q") {
       const [aid, verb] = rest;
       const a = cockpit.approvals.get(aid);
-      if (!a) return void done("Expired.");
+      if (!a) { qState.delete(aid); return void done("Expired."); }
       const sess = cockpit.live.get(a.sessionKey);
       const rec = sess?.rec ?? null;
       const editPrompt = async (verdict: string): Promise<void> => {
@@ -905,17 +906,55 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
         return void done();
       }
       if (head === "q") {
-        const q = (a.input.questions as Array<Record<string, unknown>> | undefined)?.[0];
-        if (verb === "o") {
-          if (rec) awaiting.set(`${cfg.chatId}:${rec.topicId ?? 0}`, { type: "questionOther", aid });
-          await editPrompt("✍️ Send your answer as a normal message.");
-        } else {
-          const opts = (q?.options as Array<{ label: string }> | undefined) ?? [];
-          const label = opts[Number(verb)]?.label ?? verb;
-          a.resolve({ behavior: "allow", updatedInput: { ...a.input, answers: { [String(q?.question ?? "q")]: label } } });
+        // q:<aid>:<qIdx>:<optIdx> toggles/answers · q:<aid>:<qIdx>:o = free text · q:<aid>:submit.
+        // A single single-select question answers on first tap; anything else collects then submits.
+        const questions = (a.input.questions as Array<Record<string, unknown>> | undefined) ?? [];
+        const instant = questions.length === 1 && !questions[0]?.multiSelect;
+        const sel = qState.get(aid) ?? new Map<number, Set<number> | string>();
+        qState.set(aid, sel);
+        const finish = async (answers: Record<string, string>): Promise<void> => {
+          a.resolve({ behavior: "allow", updatedInput: { ...a.input, answers } });
           cockpit.approvals.delete(aid);
-          await editPrompt(`💬 answered: <b>${esc(label)}</b>`);
+          qState.delete(aid);
+          await editPrompt(`💬 answered: <b>${esc(Object.values(answers).join(" · ")).slice(0, 300)}</b>`);
+        };
+        if (verb === "submit") {
+          const answers: Record<string, string> = {};
+          for (let qi = 0; qi < questions.length; qi++) {
+            const picked = sel.get(qi);
+            const opts = (questions[qi].options as Array<{ label: string }> | undefined) ?? [];
+            if (typeof picked === "string") answers[String(questions[qi].question ?? `q${qi + 1}`)] = picked;
+            else if (picked instanceof Set && picked.size)
+              answers[String(questions[qi].question ?? `q${qi + 1}`)] = [...picked].sort((x, y) => x - y).map((i) => opts[i]?.label ?? String(i)).join(", ");
+            else return void done(`Answer all ${questions.length} question${questions.length > 1 ? "s" : ""} first (question ${qi + 1} is empty).`);
+          }
+          await finish(answers);
+          return void done();
         }
+        const qi = Number(verb);
+        const q = questions[qi];
+        if (!q) return void done("Expired.");
+        const third = rest[2];
+        if (third === "o") {
+          if (rec) awaiting.set(`${cfg.chatId}:${rec.topicId ?? 0}`, { type: "questionOther", aid, qIdx: qi });
+          if (instant) await editPrompt("✍️ Send your answer as a normal message.");
+          else await cockpit.say(rec, `✍️ Send your answer to question ${qi + 1} as a normal message.`);
+          return void done();
+        }
+        const oi = Number(third);
+        const opts = (q.options as Array<{ label: string }> | undefined) ?? [];
+        if (!opts[oi]) return void done("Expired.");
+        if (instant) { await finish({ [String(q.question ?? "q")]: opts[oi].label }); return void done(); }
+        const cur = sel.get(qi);
+        if (q.multiSelect) {
+          const set = cur instanceof Set ? cur : new Set<number>();
+          if (set.has(oi)) set.delete(oi); else set.add(oi);
+          sel.set(qi, set);
+        } else {
+          sel.set(qi, new Set([oi])); // single-select within a multi-question ask: replace
+        }
+        if (a.messageId && cfg.chatId)
+          await bot.api.editMessageReplyMarkup(cfg.chatId, a.messageId, { reply_markup: cockpit.questionKb(a, sel) }).catch(() => undefined);
         return void done();
       }
     }
@@ -1208,10 +1247,26 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
         cockpit.approvals.delete(wait.aid);
         await ctx.reply("✏️ Feedback sent — Claude is revising the plan.");
       } else {
-        const q = (a.input.questions as Array<Record<string, unknown>> | undefined)?.[0];
-        a.resolve({ behavior: "allow", updatedInput: { ...a.input, answers: { [String(q?.question ?? "q")]: text } } });
-        cockpit.approvals.delete(wait.aid);
-        await ctx.reply("💬 Answer sent.");
+        // questionOther: a free-text answer for one question. A single single-select question
+        // resolves immediately; in a multi-question/multi-select ask it's recorded and the user
+        // submits from the keyboard once every question is answered.
+        const questions = (a.input.questions as Array<Record<string, unknown>> | undefined) ?? [];
+        const instant = questions.length === 1 && !questions[0]?.multiSelect;
+        const qi = wait.qIdx ?? 0;
+        const q = questions[qi];
+        if (instant || !q) {
+          a.resolve({ behavior: "allow", updatedInput: { ...a.input, answers: { [String(q?.question ?? "q")]: text } } });
+          cockpit.approvals.delete(wait.aid);
+          qState.delete(wait.aid);
+          await ctx.reply("💬 Answer sent.");
+        } else {
+          const sel = qState.get(wait.aid) ?? new Map<number, Set<number> | string>();
+          sel.set(qi, text);
+          qState.set(wait.aid, sel);
+          if (a.messageId && cfg.chatId)
+            await bot.api.editMessageReplyMarkup(cfg.chatId, a.messageId, { reply_markup: cockpit.questionKb(a, sel) }).catch(() => undefined);
+          await ctx.reply(`💬 Recorded for question ${qi + 1} — tap 📨 Submit answers once every question is answered.`);
+        }
       }
       return;
     }
