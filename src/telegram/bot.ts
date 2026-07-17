@@ -2,7 +2,7 @@
 // update that is not from the paired owner id (silently, logged).
 import { autoRetry } from "@grammyjs/auto-retry";
 import { Bot, Context, InlineKeyboard, InputFile } from "grammy";
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
@@ -485,12 +485,16 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
     const arg = ctx.match?.trim().toLowerCase();
     const st = foreignState();
     if (arg?.startsWith("on")) {
-      const mins = Number(arg.split(/\s+/)[1]);
-      const idle = Number.isFinite(mins) && mins > 0 ? Math.round(mins * 60) : st.idleSeconds;
+      const word = arg.split(/\s+/)[1];
+      const now = word === "now" || word === "0"; // forward even while you're at the Mac (item 2)
+      const mins = Number(word);
+      const idle = now ? 0 : Number.isFinite(mins) && mins > 0 ? Math.round(mins * 60) : st.idleSeconds;
       const s = enableForeign(idle);
-      const thresh = s.idleSeconds < 60 ? `${s.idleSeconds}s` : `${Math.round(s.idleSeconds / 60)} min`;
+      const thresh = s.idleSeconds <= 0 ? "<b>immediately — even while you're at the Mac</b>" : s.idleSeconds < 60 ? `after <b>${s.idleSeconds}s</b> idle` : `after <b>${Math.round(s.idleSeconds / 60)} min</b> idle`;
       return void ctx.reply(
-        `✅ Away-mode <b>ON</b>. When you've been away from the Mac for <b>${thresh}</b>, permission prompts from desktop/terminal sessions come here with Allow/Deny. No answer in ~2 min → the prompt waits on the Mac. <code>/foreign off</code> to stop.`,
+        `✅ Away-mode <b>ON</b> — permission & plan prompts from desktop/terminal sessions come here ${thresh}, with Allow / Deny. No answer in ~2 min → the prompt waits on the Mac.\n` +
+        "<i>This catches prompts from now on. A prompt <b>already showing</b> on the Mac before you enabled this can't be pulled here — answer that one on the Mac; new ones forward.</i>\n" +
+        "<code>/foreign off</code> to stop.",
         { parse_mode: "HTML" });
     }
     if (arg === "off") {
@@ -499,10 +503,52 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
       return void ctx.reply("🚫 Away-mode OFF. The global hook is removed — zero effect on your desktop sessions. (Any \"always allow\" grants were cleared.)");
     }
     await ctx.reply(
-      `<b>Away-mode</b>: ${st.enabled ? "🟢 ON" : "⚪️ off"}\nIdle threshold: <b>${Math.round(st.idleSeconds / 60)} min</b>\n\n` +
-      "Forwards permission prompts from sessions you started <i>outside</i> Telegram (desktop app / terminal) to your phone — but only while you're away from the Mac, and only for approval-worthy tools. Fails safe to the normal desktop prompt.\n\n" +
-      "<code>/foreign on</code> · <code>/foreign on 5</code> (idle minutes) · <code>/foreign off</code>",
+      `<b>Away-mode</b>: ${st.enabled ? "🟢 ON" : "⚪️ off"}\nIdle threshold: <b>${st.idleSeconds <= 0 ? "0 (forwards immediately)" : `${Math.round(st.idleSeconds / 60)} min`}</b>\n\n` +
+      "Forwards permission/plan prompts from sessions you started <i>outside</i> Telegram (desktop app / terminal) to your phone, for approval-worthy tools. Fails safe to the normal desktop prompt on any timeout. Only NEW prompts forward (a prompt already on the Mac stays there).\n\n" +
+      "<code>/foreign on</code> (only when idle) · <code>/foreign on 5</code> (idle minutes) · <code>/foreign on now</code> (even while at the Mac) · <code>/foreign off</code>",
       { parse_mode: "HTML" });
+  });
+
+  // Re-login an account from the phone (item 4). OAuth needs a browser on the Mac (the callback
+  // returns to the Mac's localhost), so this TRIGGERS the sign-in there and confirms here when it
+  // lands — it can't complete the sign-in on your phone.
+  async function startLogin(a: { name: string; configDir: string | null }): Promise<void> {
+    if (accountConnected(a)) { await cockpit.say(null, `<b>${esc(a.name)}</b> is already logged in.`); return; }
+    const env: Record<string, string> = {};
+    for (const [k, v] of Object.entries(process.env)) if (v !== undefined) env[k] = v;
+    if (a.configDir) env.CLAUDE_CONFIG_DIR = a.configDir;
+    const manual = `<code>${a.configDir ? `CLAUDE_CONFIG_DIR=${esc(a.configDir)} ` : ""}claude auth login</code>`;
+    await cockpit.say(null, `🔐 Launching sign-in for <b>${esc(a.name)}</b> on the Mac — a browser should open there. Finish it in that browser; the callback returns to the Mac, so it can't be completed on your phone. I'll confirm here when it lands.`);
+    let child: ReturnType<typeof spawn>;
+    try { child = spawn("claude", ["auth", "login", "--claudeai"], { env, stdio: ["ignore", "pipe", "pipe"] }); }
+    catch (e) { await cockpit.say(null, `⚠️ Couldn't start it: ${esc(e instanceof Error ? e.message : String(e))}. On the Mac run ${manual}.`); return; }
+    let urlSent = false;
+    const scan = (buf: Buffer): void => {
+      const m = String(buf).match(/https?:\/\/\S+/);
+      if (m && !urlSent) { urlSent = true; void cockpit.say(null, `🔗 If no browser opened, open this <b>on the Mac</b>:\n${esc(m[0])}`); }
+    };
+    child.stdout?.on("data", scan);
+    child.stderr?.on("data", scan);
+    child.on("error", (e) => void cockpit.say(null, `⚠️ Sign-in couldn't start: ${esc(e.message)}. On the Mac run ${manual}.`));
+    const deadline = Date.now() + 180_000;
+    const poll = setInterval(() => {
+      if (accountConnected(a)) { clearInterval(poll); void cockpit.say(null, `✅ <b>${esc(a.name)}</b> is now logged in. /usage to confirm.`); }
+      else if (Date.now() > deadline) { clearInterval(poll); try { child.kill(); } catch { /* */ } void cockpit.say(null, `⌛ Sign-in for <b>${esc(a.name)}</b> didn't finish in 3 min. Complete it in the Mac's browser, then /usage — or retry /login.`); }
+    }, 5000);
+  }
+
+  bot.command("login", async (ctx) => {
+    const arg = ctx.match?.trim();
+    if (arg) {
+      const a = cfg.accounts.find((x) => x.name === arg);
+      if (!a) return void ctx.reply(`No account named "${esc(arg)}". Known: ${cfg.accounts.map((x) => esc(x.name)).join(", ")}.`);
+      return void startLogin(a);
+    }
+    const disconnected = cfg.accounts.filter((a) => !accountConnected(a));
+    if (!disconnected.length) return void ctx.reply("All configured accounts are already logged in. (/usage to check.)");
+    const kb = new InlineKeyboard();
+    disconnected.forEach((a) => kb.text(`🔐 Sign in ${a.name}`, `login:${putRef("login", a.name)}`).row());
+    await ctx.reply("Which account needs signing in? A browser opens on your Mac — finish there.", { reply_markup: kb });
   });
 
   bot.command("use", async (ctx) => {
@@ -1196,6 +1242,15 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
       }
       return void done();
     }
+    if (head === "login") {
+      const name = getRef("login", rest[0]);
+      const a = name ? cfg.accounts.find((x) => x.name === name) : undefined;
+      await done();
+      if (!a) return void ctx.editMessageText("Expired — run /login again.").catch(() => undefined);
+      await ctx.editMessageText(`🔐 Signing in <b>${esc(a.name)}</b>…`, { parse_mode: "HTML" }).catch(() => undefined);
+      await startLogin(a);
+      return;
+    }
     if (head === "pf") {
       const f = getRef("plan", rest[0]);
       await done();
@@ -1309,6 +1364,7 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
     { command: "info", description: "Full details: session, usage, limits, account" },
     { command: "usage", description: "5h + weekly limits per account" },
     { command: "health", description: "Self-check: CLI, away-mode, accounts, pairing" },
+    { command: "login", description: "Sign a logged-out account back in (browser opens on the Mac)" },
     { command: "bindchat", description: "Move the cockpit to THIS chat (confirmed)" },
     { command: "model", description: "Switch model" },
     { command: "mode", description: "Switch permission mode" },
