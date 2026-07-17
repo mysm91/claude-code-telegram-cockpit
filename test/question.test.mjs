@@ -55,16 +55,18 @@ test("#12: keyboard has per-question toggle buttons, per-question Other, and one
   } finally { fake.reset(); }
 });
 
-test("#12: questionKb reflects toggle state (checkmarks) and single-question fast path has no Submit", async () => {
+test("#12: multi-select options and a free-text 'Other' COEXIST (the bug fix); single-question fast path has no Submit", async () => {
   const { fake, cockpit } = await setup();
   try {
     const [a] = [...cockpit.approvals.values()];
-    const sel = new Map([[0, new Set([1])], [1, "free text answer"]]);
+    // Q1 (multi-select): options 0 AND 1 picked AND a typed "other" — all three ticked at once.
+    const sel = new Map([[0, { opts: new Set([0, 1]), other: "kiwi" }], [1, { opts: new Set(), other: "free text answer" }]]);
     const kb = cockpit.questionKb(a, sel).inline_keyboard.flat();
     const label = (data) => kb.find((b) => b.callback_data === data)?.text ?? "";
-    assert.ok(label(`q:${a.id}:0:1`).includes("✅"), "picked multi option shows ✅");
-    assert.ok(label(`q:${a.id}:0:0`).includes("▫️"), "unpicked option shows ▫️");
-    assert.ok(label(`q:${a.id}:1:o`).includes("✅"), "free-text answer marks Other as ✅");
+    assert.ok(label(`q:${a.id}:0:0`).includes("✅"), "picked option 0 shows ✅");
+    assert.ok(label(`q:${a.id}:0:1`).includes("✅"), "picked option 1 shows ✅");
+    assert.ok(label(`q:${a.id}:0:o`).includes("✅"), "free-text coexists → Other also ✅ (was the bug)");
+    assert.ok(label(`q:${a.id}:1:o`).includes("✅"), "Q2 free-text marks Other ✅");
     // Single single-select question → instant mode: no submit, no toggle prefixes
     const single = { ...a, input: { questions: [QUESTIONS[1]] } };
     const kb2 = cockpit.questionKb(single, new Map()).inline_keyboard.flat();

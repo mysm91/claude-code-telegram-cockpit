@@ -93,7 +93,7 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
 
   let activeKey: string | null = null; // flat-mode active session
   const awaiting = new Map<string, Awaiting>(); // threadKey -> pending input
-  const qState = new Map<string, Map<number, Set<number> | string>>(); // AskUserQuestion selections per approval id
+  const qState = new Map<string, Map<number, { opts: Set<number>; other?: string }>>(); // AskUserQuestion selections per approval id
   let lastList: LocalSession[] = [];
 
   // Opaque callback refs (review finding #6): callback_data must never carry a bare index into a
@@ -910,7 +910,7 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
         // A single single-select question answers on first tap; anything else collects then submits.
         const questions = (a.input.questions as Array<Record<string, unknown>> | undefined) ?? [];
         const instant = questions.length === 1 && !questions[0]?.multiSelect;
-        const sel = qState.get(aid) ?? new Map<number, Set<number> | string>();
+        const sel = qState.get(aid) ?? new Map<number, { opts: Set<number>; other?: string }>();
         qState.set(aid, sel);
         const finish = async (answers: Record<string, string>): Promise<void> => {
           a.resolve({ behavior: "allow", updatedInput: { ...a.input, answers } });
@@ -923,10 +923,10 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
           for (let qi = 0; qi < questions.length; qi++) {
             const picked = sel.get(qi);
             const opts = (questions[qi].options as Array<{ label: string }> | undefined) ?? [];
-            if (typeof picked === "string") answers[String(questions[qi].question ?? `q${qi + 1}`)] = picked;
-            else if (picked instanceof Set && picked.size)
-              answers[String(questions[qi].question ?? `q${qi + 1}`)] = [...picked].sort((x, y) => x - y).map((i) => opts[i]?.label ?? String(i)).join(", ");
-            else return void done(`Answer all ${questions.length} question${questions.length > 1 ? "s" : ""} first (question ${qi + 1} is empty).`);
+            const parts = picked ? [...picked.opts].sort((x, y) => x - y).map((i) => opts[i]?.label ?? String(i)) : [];
+            if (picked?.other) parts.push(picked.other); // picked options + a typed "other" combine (multi-select)
+            if (!parts.length) return void done(`Answer all ${questions.length} question${questions.length > 1 ? "s" : ""} first (question ${qi + 1} is empty).`);
+            answers[String(questions[qi].question ?? `q${qi + 1}`)] = parts.join(", ");
           }
           await finish(answers);
           return void done();
@@ -945,14 +945,14 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
         const opts = (q.options as Array<{ label: string }> | undefined) ?? [];
         if (!opts[oi]) return void done("Expired.");
         if (instant) { await finish({ [String(q.question ?? "q")]: opts[oi].label }); return void done(); }
-        const cur = sel.get(qi);
+        const entry = sel.get(qi) ?? { opts: new Set<number>() };
         if (q.multiSelect) {
-          const set = cur instanceof Set ? cur : new Set<number>();
-          if (set.has(oi)) set.delete(oi); else set.add(oi);
-          sel.set(qi, set);
+          if (entry.opts.has(oi)) entry.opts.delete(oi); else entry.opts.add(oi); // toggle; keep any free-text "other"
         } else {
-          sel.set(qi, new Set([oi])); // single-select within a multi-question ask: replace
+          entry.opts = new Set([oi]); // single-select: one option, and it clears a free-text answer
+          entry.other = undefined;
         }
+        sel.set(qi, entry);
         if (a.messageId && cfg.chatId)
           await bot.api.editMessageReplyMarkup(cfg.chatId, a.messageId, { reply_markup: cockpit.questionKb(a, sel) }).catch(() => undefined);
         return void done();
@@ -1260,12 +1260,15 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
           qState.delete(wait.aid);
           await ctx.reply("💬 Answer sent.");
         } else {
-          const sel = qState.get(wait.aid) ?? new Map<number, Set<number> | string>();
-          sel.set(qi, text);
+          const sel = qState.get(wait.aid) ?? new Map<number, { opts: Set<number>; other?: string }>();
+          const entry = sel.get(qi) ?? { opts: new Set<number>() };
+          entry.other = text;
+          if (!q.multiSelect) entry.opts = new Set(); // single-select: free text replaces the picked option
+          sel.set(qi, entry);
           qState.set(wait.aid, sel);
           if (a.messageId && cfg.chatId)
             await bot.api.editMessageReplyMarkup(cfg.chatId, a.messageId, { reply_markup: cockpit.questionKb(a, sel) }).catch(() => undefined);
-          await ctx.reply(`💬 Recorded for question ${qi + 1} — tap 📨 Submit answers once every question is answered.`);
+          await ctx.reply(`💬 Recorded for question ${qi + 1}${q.multiSelect ? " (added to your picks)" : ""} — tap 📨 Submit answers once every question is answered.`);
         }
       }
       return;

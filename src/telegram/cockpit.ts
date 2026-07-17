@@ -243,7 +243,7 @@ export class Cockpit {
   /** Inline keyboard for an AskUserQuestion approval. `sel` = current selections per question
    *  index (a Set of picked option indices, or a free-text string from "Other"). A single
    *  single-select question answers on first tap (no Submit); anything else toggles + submits. */
-  questionKb(a: PendingApproval, sel: Map<number, Set<number> | string>): InlineKeyboard {
+  questionKb(a: PendingApproval, sel: Map<number, { opts: Set<number>; other?: string }>): InlineKeyboard {
     const questions = (a.input.questions as Array<Record<string, unknown>> | undefined) ?? [];
     const kb = new InlineKeyboard();
     const instant = questions.length === 1 && !questions[0]?.multiSelect;
@@ -251,11 +251,11 @@ export class Cockpit {
       const opts = (q.options as Array<{ label: string }> | undefined) ?? [];
       const picked = sel.get(qi);
       opts.forEach((o, oi) => {
-        const on = picked instanceof Set && picked.has(oi);
+        const on = picked?.opts.has(oi) ?? false;
         const prefix = instant ? "" : on ? "✅ " : "▫️ ";
         kb.text(`${questions.length > 1 ? `${qi + 1}. ` : ""}${prefix}${o.label.slice(0, 48)}`, `q:${a.id}:${qi}:${oi}`).row();
       });
-      kb.text(`${typeof picked === "string" ? "✅ " : ""}✍️ Other${questions.length > 1 ? ` (Q${qi + 1})` : "…"}`, `q:${a.id}:${qi}:o`).row();
+      kb.text(`${picked?.other ? "✅ " : ""}✍️ Other${questions.length > 1 ? ` (Q${qi + 1})` : "…"}`, `q:${a.id}:${qi}:o`).row();
     });
     if (!instant) kb.text("📨 Submit answers", `q:${a.id}:submit`);
     return kb;
