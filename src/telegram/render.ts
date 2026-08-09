@@ -75,7 +75,12 @@ const renderInline = (raw: string): string => {
   t = t.replace(
     /\[([^\]\n]*)\]\((https?:\/\/[^\s)]+)\)/g,
     (_m, label: string, url: string) =>
-      url.length > MAX_HREF ? `${esc(label)} (${esc(url)})` : keep(`<a href="${escAttr(url)}">${emph(esc(label))}</a>`),
+      // Both branches go through keep(): held-out text is escaped exactly once and emphasis can
+      // never run inside it. Splicing the fallback back as bare text would double-escape every
+      // `&` in the URL and let a stray `*`/`~~` inside it pair with the surrounding prose.
+      escAttr(url).length > MAX_HREF
+        ? keep(`${esc(label)} (${esc(url)})`)
+        : keep(`<a href="${escAttr(url)}">${emph(esc(label))}</a>`),
   );
   return restore(emph(esc(t)));
 };

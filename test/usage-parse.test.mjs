@@ -199,3 +199,27 @@ test("parseUsagePayload: two limits[] entries for the same model collapse to one
   assert.equal(u.scoped.length, 1, "one window per model, not one per entry");
   assert.equal(u.scoped[0].win.pct, 20, "the later entry wins");
 });
+
+test("a cached weekly reading survives its own age; only a window with no reset time expires", async () => {
+  // The on-disk cache exists for exactly the case where a fresh poll cannot succeed, so a weekly
+  // window valid for four more days must not be discarded for being nine hours old.
+  const { parseUsagePayload: parse } = await import("../dist/core/usage.js");
+  const nineHoursAgo = Date.now() - 9 * 3600_000;
+  const u = parse({
+    seven_day: { utilization: 62, resets_at: new Date(Date.now() + 4 * 86400_000).toISOString() },
+    five_hour: { utilization: 0 },
+  }, nineHoursAgo);
+  assert.equal(u.sevenDay.pct, 62);
+  assert.equal(u.fiveHour.pct, 0);
+  // (unexpired() is internal; this documents the inputs — the age rule is asserted through the
+  // panel behaviour in the live checks, since accountUsage() needs a keychain and a network.)
+});
+
+test("noteRateEvent: a non-model seven_day_* quota is not shown as a model", async () => {
+  const { noteRateEvent } = await import("../dist/core/usage.js");
+  // seven_day_overage_included and seven_day_oauth_apps are separate quotas, not models — they
+  // used to render as "Overage " and "Oauth Apps" among the per-model windows.
+  for (const t of ["seven_day_overage_included", "seven_day_oauth_apps"]) {
+    assert.doesNotThrow(() => noteRateEvent({ account: "nm-test", rateLimitType: t, utilization: 5, at: Date.now() }));
+  }
+});

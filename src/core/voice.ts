@@ -106,11 +106,12 @@ export function parseGeminiJson(stdout: string): string | null {
   const direct = attempt(stdout);
   if (direct) return direct;
   // The CLI wraps its JSON in whatever it feels like — a log line before it, a "session saved"
-  // trailer after it, or a ```json fence. Try every brace-balanced candidate, newest first, so a
-  // trailing notice or a brace-bearing preamble can't cost us a perfectly good transcript.
+  // trailer after it, or a ```json fence. Try brace-balanced candidates from the OUTSIDE in, so a
+  // nested or trailing object that happens to carry a `.response` can't outrank the real payload,
+  // and cap the attempts: this runs on the daemon's only thread against up to 4 MB of stdout.
   const starts: number[] = [];
-  for (let i = 0; i < stdout.length; i++) if (stdout[i] === "{") starts.push(i);
-  for (const start of starts.reverse()) {
+  for (let i = 0; i < stdout.length && starts.length < 200; i++) if (stdout[i] === "{") starts.push(i);
+  for (const start of starts) {
     let depth = 0, inStr = false, escaped = false;
     for (let i = start; i < stdout.length; i++) {
       const c = stdout[i];
@@ -132,11 +133,11 @@ export function parseGeminiJson(stdout: string): string | null {
   return null;
 }
 
-/** The CLI narrates its own failures in prose ("Error: I could not access the file…", a refusal,
- *  a quota notice) and puts them in `.response`, where they are indistinguishable from a transcript
- *  by shape. Sending one to the session would put words in the user's mouth, so refuse them. */
-const NOT_A_TRANSCRIPT =
-  /^(error\b|sorry\b|i (?:cannot|can't|could not|couldn't|am unable|was unable)\b|as an ai\b|unable to\b|failed to\b)/i;
+/** The CLI sometimes narrates a failure in `.response` instead of transcribing. Only signals a
+ *  real transcript cannot produce are used to detect that: the sentinel from the prompt, a
+ *  non-zero exit, or the response quoting our @filename back at us. Judging by opening words
+ *  cannot work — "Sorry, I forgot to say…" and "I can't reproduce the crash" are things people
+ *  actually say, and throwing those away loses the user's words with a misleading error. */
 
 // Extensions the gemini CLI accepts for audio, plus .m4a/.mp4 which transcribe() remuxes first.
 const AUDIO_EXTS = new Set([".ogg", ".oga", ".mp3", ".aac", ".wav", ".flac", ".m4a", ".mp4"]);
@@ -185,14 +186,17 @@ function pruneGeminiState(cwd: string): void {
   const root = path.join(os.homedir(), ".gemini", "tmp");
   let entries: string[] = [];
   try { entries = fs.readdirSync(root); } catch { return; }
-  const want = cwd.toLowerCase();
+  // Exact matches only, against both spellings of our own tmpdir (macOS realpath prefixes
+  // /private). This deletes directories under $HOME, so a substring relation must never decide it:
+  // an empty .project_root would match anything under a two-way endsWith test.
+  const want = new Set([cwd.toLowerCase(), `/private${cwd}`.toLowerCase()]);
+  try { want.add(fs.realpathSync(cwd).toLowerCase()); } catch { /* the dir may already be gone */ }
   for (const e of entries) {
     const dir = path.join(root, e);
     try {
       const owner = fs.readFileSync(path.join(dir, ".project_root"), "utf8").trim().toLowerCase();
-      // realpath prefixes /private on macOS, so compare on the basename-bearing suffix too.
-      if (owner === want || owner.endsWith(want) || want.endsWith(owner)) fs.rmSync(dir, { recursive: true, force: true });
-    } catch { /* not ours, or already gone */ }
+      if (owner && want.has(owner)) fs.rmSync(dir, { recursive: true, force: true });
+    } catch { /* no marker, not ours, or already gone */ }
   }
 }
 
@@ -224,7 +228,7 @@ export async function transcribe(audio: Buffer, ext: string, vs: VoiceSettings):
           { cwd: dir, env, timeout: vs.sttTimeoutMs, killSignal: "SIGKILL", maxBuffer: 4 * 1024 * 1024 });
         const text = parseGeminiJson(stdout);
         if (text && /^\[inaudible\]\.?$/i.test(text)) return { ok: false, error: "the audio was silent or unintelligible" };
-        if (text && (NOT_A_TRANSCRIPT.test(text) || text.includes(`@${file}`)))
+        if (text && text.includes(`@${file}`))
           return { ok: false, error: "the transcriber reported a problem instead of a transcript" };
         if (text) {
           console.log(`voice: transcribed in ${Math.round((Date.now() - started) / 1000)}s, ${text.length} chars`);
@@ -246,8 +250,10 @@ export async function transcribe(audio: Buffer, ext: string, vs: VoiceSettings):
     return { ok: false, error: "couldn't stage the audio locally" };
   } finally {
     if (dir) {
-      try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* best-effort */ }
+      // Prune BEFORE our own dir goes away: the match resolves the tmpdir's real path, which is
+      // unavailable once it is deleted (that left the CLI's copy of the audio behind).
       pruneGeminiState(dir);
+      try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* best-effort */ }
     }
   }
 }

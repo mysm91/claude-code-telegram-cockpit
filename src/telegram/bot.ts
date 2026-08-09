@@ -43,6 +43,11 @@ const effortLabel = (id?: string): string => (id ? EFFORTS.find((e) => e.id === 
 const SESSIONS_PER_PAGE = 10;
 const shortPath = (p: string): string => p.replace(/^\/Users\//, "");
 
+// How long the cockpit keeps waiting for a typed/spoken answer to a prompt. Past this, the next
+// message is an ordinary message again: an abandoned /new picker or an approval that already
+// timed out must not silently swallow what you say next (it used to eat the whole message).
+const AWAIT_TTL_MS = 10 * 60_000;
+
 type Awaiting =
   | { type: "dir" }
   | { type: "planFeedback"; aid: string }
@@ -92,7 +97,7 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
   let pairingCode = cfg.ownerId ? null : issuePairingCode();
 
   let activeKey: string | null = null; // flat-mode active session
-  const awaiting = new Map<string, Awaiting>(); // threadKey -> pending input
+  const awaiting = new Map<string, Awaiting & { at: number }>(); // threadKey -> pending input
   const qState = new Map<string, Map<number, { opts: Set<number>; other?: string }>>(); // AskUserQuestion selections per approval id
   let lastList: LocalSession[] = [];
 
@@ -287,7 +292,7 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
     }
     newDirs = await projectDirs();
     newDirsPage = 0;
-    awaiting.set(threadKey(ctx), { type: "dir" });
+    awaiting.set(threadKey(ctx), { type: "dir", at: Date.now() });
     await ctx.reply(
       `Where should the session run? Tap a project folder (${newDirs.length} with local sessions) or type an absolute path:`,
       { parse_mode: "HTML", reply_markup: newDirsKb(0) },
@@ -1000,7 +1005,7 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
           setTimeout(() => void sess?.setMode(mode).then(() => store.flushSessions()).catch(() => undefined), 500);
           await editPrompt(`✅ plan approved → mode <b>${mode}</b>`);
         } else if (verb === "r") {
-          if (rec) awaiting.set(`${cfg.chatId}:${rec.topicId ?? 0}`, { type: "planFeedback", aid });
+          if (rec) awaiting.set(`${cfg.chatId}:${rec.topicId ?? 0}`, { type: "planFeedback", aid, at: Date.now() });
           await editPrompt("✏️ Send your revision feedback as a normal message.");
         } else if (verb === "x") {
           a.resolve({ behavior: "deny", message: "Plan rejected by the user. Stop and wait for new instructions.", interrupt: true });
@@ -1040,7 +1045,7 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
         if (!q) return void done("Expired.");
         const third = rest[2];
         if (third === "o") {
-          if (rec) awaiting.set(`${cfg.chatId}:${rec.topicId ?? 0}`, { type: "questionOther", aid, qIdx: qi });
+          if (rec) awaiting.set(`${cfg.chatId}:${rec.topicId ?? 0}`, { type: "questionOther", aid, qIdx: qi, at: Date.now() });
           if (instant) await editPrompt("✍️ Send your answer as a normal message.");
           else await cockpit.say(rec, `✍️ Send your answer to question ${qi + 1} as a normal message.`);
           return void done();
@@ -1288,7 +1293,10 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
         // follows the account/org default (and every future model bump) instead of pinning a name.
         const pick = choice.id === "default" ? undefined : choice.id;
         if (sess) await sess.setModel(pick);
-        else if (rec2) { if (pick) rec2.model = pick; else delete rec2.model; }
+        else if (rec2) {
+          if (pick) rec2.model = pick; else delete rec2.model;
+          delete rec2.resolvedModel; // same reason as setModel: don't keep claiming the old one runs
+        }
         store.flushSessions();
         const suffix = sess ? "" : " <i>(applies when the session resumes)</i>";
         await ctx.editMessageText(`Model → <b>${esc(choice.label)}</b> ✅${suffix}`, { parse_mode: "HTML" }).catch(() => undefined);
@@ -1329,10 +1337,14 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
       if (!a) return void done("Expired — run /usage again.");
       if (!shouldWarmup(a.name, { manual: true })) return void done("Pinged very recently — give it a few minutes.");
       await done("Renewing the token…");
-      const r = await warmupAccount(a, cfg);
-      const panel = await usagePanel();
-      await ctx.editMessageText(panel.text, { parse_mode: "HTML", ...(panel.kb ? { reply_markup: panel.kb } : {}) }).catch(() => undefined);
-      if (!r.ok) await cockpit.say(null, `⚠️ <b>${esc(a.name)}</b>: ${esc(r.error ?? "warm-up failed")} — <code>/login</code> to re-auth it.`);
+      // Detached for the same reason as the /usage loop: a ping is a CLI spawn (up to 90 s) and
+      // grammY processes updates one at a time, so awaiting here would freeze every other tap.
+      void (async () => {
+        const r = await warmupAccount(a, cfg);
+        const panel = await usagePanel();
+        await ctx.editMessageText(panel.text, { parse_mode: "HTML", ...(panel.kb ? { reply_markup: panel.kb } : {}) }).catch(() => undefined);
+        if (!r.ok) await cockpit.say(null, `⚠️ <b>${esc(a.name)}</b>: ${esc(r.error ?? "warm-up failed")} — <code>/login</code> to re-auth it.`);
+      })();
       return;
     }
     if (head === "login") {
@@ -1367,10 +1379,10 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
       return true;
     }
     const tk = `${cfg.chatId}:${(ctx.message ?? ctx.callbackQuery?.message)?.message_thread_id ?? 0}`;
-    const wait = awaiting.get(tk) ?? awaiting.get(threadKey(ctx));
+    const found = awaiting.get(tk) ?? awaiting.get(threadKey(ctx));
+    const wait = found && Date.now() - found.at <= AWAIT_TTL_MS ? found : undefined;
+    if (found) { awaiting.delete(tk); awaiting.delete(threadKey(ctx)); }
     if (wait) {
-      awaiting.delete(tk);
-      awaiting.delete(threadKey(ctx));
       if (wait.type === "dir") {
         const abs = text.trim().startsWith("~") ? text.trim().replace("~", process.env.HOME ?? "") : text.trim();
         const ok = await startSession(path.resolve(abs));
@@ -1378,7 +1390,9 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
         return true;
       }
       const a = cockpit.approvals.get(wait.aid);
-      if (!a) { await ctx.reply("That prompt expired."); return true; }
+      // The prompt is already gone (answered elsewhere, or auto-denied on timeout). Don't eat the
+      // message: let it through as ordinary input, which is what the user almost certainly meant.
+      if (!a) { await ctx.reply("<i>(that prompt had already expired — sending this as a normal message)</i>", { parse_mode: "HTML" }).catch(() => undefined); return false; }
       if (wait.type === "planFeedback") {
         a.resolve({ behavior: "deny", message: `Revise the plan based on this feedback: ${text}` });
         cockpit.approvals.delete(wait.aid);

@@ -48,10 +48,13 @@ export function noteRateEvent(info: RateInfo): void {
   else if (info.rateLimitType === "seven_day") u.sevenDay = w;
   else if (info.rateLimitType?.startsWith("seven_day_")) {
     // "seven_day_opus" → "Opus", matching the display names the API uses, so the same window
-    // doesn't change label depending on which source reported it last.
-    const raw = info.rateLimitType.slice("seven_day_".length).replace(/_/g, " ");
-    const name = raw.replace(/\b[a-z]/g, (c) => c.toUpperCase());
-    u.scoped = [...(u.scoped ?? []).filter((s) => s.name.toLowerCase() !== name.toLowerCase()), { name, win: w }];
+    // doesn't change label depending on which source reported it last. Not every suffix is a
+    // model, though — these are separate quotas and would read as fictional models.
+    const suffix = info.rateLimitType.slice("seven_day_".length);
+    if (suffix !== "overage_included" && suffix !== "oauth_apps") {
+      const name = suffix.replace(/_/g, " ").replace(/\b[a-z]/g, (c) => c.toUpperCase());
+      u.scoped = [...(u.scoped ?? []).filter((s) => s.name.toLowerCase() !== name.toLowerCase()), { name, win: w }];
+    }
   }
   streamCache.set(info.account, u);
 }
@@ -194,6 +197,10 @@ export function parseUsagePayload(d: unknown, now: number): AccountUsage {
 }
 
 const nextPoll = new Map<string, number>(); // account -> earliest ok time for the next API poll
+// Accounts whose token the API rejected. Remembered rather than re-derived per call: a 401 installs
+// a 10-minute backoff, and every panel drawn inside that window would otherwise poll nothing, find
+// no reason, and tell the user their token is merely "idle" — dropping the buttons that fix it.
+const rejected = new Set<string>();
 const CACHE_FILE = path.join(STATE_DIR, "usage-cache.json");
 
 // apiCache survives daemon restarts (each deploy restarts us) so /usage keeps the last
@@ -212,13 +219,15 @@ function persistCache(): void {
  *  0% — which also suppressed the "token expired" state and the pool-exhausted offer. */
 const MAX_AGE_MS = 6 * 3600_000;
 
-/** A window whose reset time has passed describes the PREVIOUS window; one older than
- *  MAX_AGE_MS describes a day nobody cares about. Either way: drop it. */
+/** A window whose reset time has passed describes the PREVIOUS window — drop it. A window that
+ *  carries a future reset time stays valid until then, however old the reading is (that is the
+ *  whole point of the on-disk cache: it is consulted only when a fresh poll can't succeed). The age
+ *  cap applies only to a window with NO reset time, which is what the endpoint returns for an
+ *  untouched 5-hour window and what would otherwise report 0% forever. */
 function unexpired(w?: WindowUsage): WindowUsage | undefined {
   if (!w) return undefined;
-  if (w.resetsAt && w.resetsAt * 1000 < Date.now() - 60_000) return undefined;
-  if (Date.now() - w.at > MAX_AGE_MS) return undefined;
-  return w;
+  if (w.resetsAt) return w.resetsAt * 1000 < Date.now() - 60_000 ? undefined : w;
+  return Date.now() - w.at > MAX_AGE_MS ? undefined : w;
 }
 
 /** Merge per-model windows by name (case-insensitively), freshest wins. The live stream only ever
@@ -252,15 +261,15 @@ export async function accountUsage(a: AccountCfg): Promise<AccountUsage> {
     sevenDay: pick(live.sevenDay, snap.sevenDay),
     scoped: mergeScoped(live.scoped, snap.scoped),
   };
-  let needsReauth = false;
   if (!freshEnough(merged.fiveHour) || !freshEnough(merged.sevenDay)) {
     if (Date.now() >= (nextPoll.get(a.name) ?? 0)) {
       const api = await oauthUsage(a);
       if (api.fiveHour || api.sevenDay || api.scoped) {
         apiCache.set(a.name, api); persistCache();
+        rejected.delete(a.name);
         nextPoll.set(a.name, Date.now() + 180_000);       // success: respect the ~180s poll floor
       } else if (api.needsReauth) {
-        needsReauth = true;
+        rejected.add(a.name);
         nextPoll.set(a.name, Date.now() + 600_000);       // expired token won't self-heal: don't hammer the 401
       } else {
         nextPoll.set(a.name, Date.now() + 20_000);        // transient failure (429/network): retry soon, don't lock out
@@ -276,8 +285,9 @@ export async function accountUsage(a: AccountCfg): Promise<AccountUsage> {
     // poll said is the only reading there is.
     extraUsage: cached.extraUsage,
   };
-  // Only surface "reauth needed" when we have nothing else to show (cached numbers win if present).
-  if (needsReauth && !merged.fiveHour && !merged.sevenDay && !merged.scoped) merged.needsReauth = true;
+  // Only surface "reauth needed" when we have nothing else to show (cached numbers win if present),
+  // but do surface it whether or not THIS call was the one allowed to poll.
+  if (rejected.has(a.name) && !merged.fiveHour && !merged.sevenDay && !merged.scoped) merged.needsReauth = true;
   return merged;
 }
 
