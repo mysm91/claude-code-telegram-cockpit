@@ -21,7 +21,8 @@ test("lifecycle: spawn → init → stream text → finish sends the expected Te
     inst.push(msg.init("sess-123", "claude-x"));
     await tick();
     assert.equal(rec.sessionId, "sess-123", "session id captured from the init message");
-    assert.equal(rec.model, "claude-x", "model captured from init");
+    assert.equal(rec.resolvedModel, "claude-x", "resolved model captured from init");
+    assert.equal(rec.model, undefined, "the user's model choice is never overwritten by init");
 
     inst.push(msg.assistantText("final answer"));
     await tick();

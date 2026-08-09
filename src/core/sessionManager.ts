@@ -2,7 +2,6 @@
 // run in streaming-input mode so we can send follow-ups, switch model/mode, interrupt,
 // and answer permission prompts from the phone.
 import {
-  query,
   type Options,
   type PermissionMode,
   type PermissionResult,
@@ -13,13 +12,10 @@ import {
 } from "@anthropic-ai/claude-agent-sdk";
 import type { AccountCfg } from "../config.js";
 import type { SessionRec } from "../state.js";
+import { sdkQuery, __setQueryForTests } from "./sdk.js";
 
-/** The SDK query() function, injectable for tests (the fake-SDK harness drives the session
- *  lifecycle without the real SDK/network/quota). Production always uses the real query. */
-type QueryFn = typeof query;
-let _query: QueryFn = query;
-/** Test-only: swap in a fake query(); pass null to restore the real implementation. */
-export function __setQueryForTests(fn: QueryFn | null): void { _query = fn ?? query; }
+// Re-exported so the test harness keeps importing the seam from here.
+export { __setQueryForTests };
 
 /** Push-based AsyncIterable used as the query() prompt stream. */
 class InputQueue implements AsyncIterable<SDKUserMessage> {
@@ -92,6 +88,7 @@ export class ManagedSession {
   private q: Query | null = null;
   private abort = new AbortController();
   private events: SessionEvents;
+  private claudeExecutable?: string;
   pending = new Map<string, PendingApproval>();
   lastPlan = "";
   lastFinalText = "";
@@ -100,11 +97,15 @@ export class ManagedSession {
   lastResult: { isError: boolean; subtype: string } | null = null;
   /** True while the model is mid-turn (between send and the next result). */
   turnActive = false;
+  /** Whether the current turn's prompt arrived as a Telegram voice note (drives voice replies
+   *  in "auto" mode). In-memory only: a daemon restart kills the live session anyway. */
+  lastPromptWasVoice = false;
 
-  constructor(rec: SessionRec, account: AccountCfg, events: SessionEvents) {
+  constructor(rec: SessionRec, account: AccountCfg, events: SessionEvents, claudeExecutable?: string) {
     this.rec = rec;
     this.account = account;
     this.events = events;
+    this.claudeExecutable = claudeExecutable;
   }
 
   private buildOptions(resume?: string): Options {
@@ -123,6 +124,7 @@ export class ManagedSession {
       env,
       title: this.rec.title,
     };
+    if (this.claudeExecutable) opts.pathToClaudeCodeExecutable = this.claudeExecutable;
     if (this.rec.model) opts.model = this.rec.model;
     if (this.rec.effort === "ultracode") {
       opts.effort = "xhigh";
@@ -137,7 +139,7 @@ export class ManagedSession {
   /** Start (or resume) the underlying query and pump its messages. */
   start(firstPrompt?: string, resume?: string): void {
     if (firstPrompt) this.send(firstPrompt);
-    this.q = _query({ prompt: this.input, options: this.buildOptions(resume) });
+    this.q = sdkQuery()({ prompt: this.input, options: this.buildOptions(resume) });
     this.running = true;
     void this.pump();
   }
@@ -152,8 +154,11 @@ export class ManagedSession {
           case "system": {
             if ((m as { subtype?: string }).subtype === "init") {
               this.rec.sessionId = (m as { session_id?: string }).session_id ?? this.rec.sessionId;
+              // Record what the CLI resolved WITHOUT touching rec.model: overwriting the user's
+              // choice would pin today's full id forever, so a session left on the default would
+              // stop following the default once a newer model shipped.
               const model = (m as { model?: string }).model;
-              if (model) this.rec.model = model;
+              if (model) this.rec.resolvedModel = model;
             }
             break;
           }
@@ -261,15 +266,17 @@ export class ManagedSession {
     return p;
   }
 
-  send(text: string): void {
+  send(text: string, opts: { fromVoice?: boolean } = {}): void {
     this.rec.status = "running";
     this.turnActive = true;
+    this.lastPromptWasVoice = Boolean(opts.fromVoice);
     this.input.push({ type: "user", message: { role: "user", content: text }, parent_tool_use_id: null });
   }
 
   sendImage(base64: string, mediaType: string, caption?: string): void {
     this.rec.status = "running";
     this.turnActive = true;
+    this.lastPromptWasVoice = false;
     const content: Array<Record<string, unknown>> = [
       { type: "image", source: { type: "base64", media_type: mediaType, data: base64 } },
     ];
@@ -286,8 +293,10 @@ export class ManagedSession {
     await this.q?.setPermissionMode(mode as PermissionMode);
   }
 
-  async setModel(model: string): Promise<void> {
-    this.rec.model = model;
+  /** undefined clears the pin (back to the account/org default). */
+  async setModel(model?: string): Promise<void> {
+    if (model) this.rec.model = model;
+    else delete this.rec.model;
     await this.q?.setModel(model);
   }
 

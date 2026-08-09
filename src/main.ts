@@ -4,6 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { botToken, loadConfig, STATE_DIR } from "./config.js";
 import { installRedactedConsole } from "./core/log.js";
+import { refreshCatalogIfStale } from "./core/modelCatalog.js";
 import { Store } from "./state.js";
 import { createBot } from "./telegram/bot.js";
 
@@ -45,6 +46,9 @@ process.on("unhandledRejection", (e) => console.error("unhandledRejection", e));
 process.on("uncaughtException", (e) => console.error("uncaughtException", e));
 
 console.log(`claude-tg-bridge starting (state: ${STATE_DIR}, paired: ${Boolean(cfg.ownerId)})`);
+// Refresh the /model catalog once per CLI version, so the menu is right immediately after a
+// restart instead of only after the first session has run a turn.
+void refreshCatalogIfStale(cfg.accounts.find((a) => a.name === cfg.activeAccount) ?? cfg.accounts[0], cfg);
 void bot.start({
   onStart: (me) => console.log(`long-polling as @${me.username}`),
   allowed_updates: ["message", "callback_query"],

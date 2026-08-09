@@ -51,11 +51,14 @@ hook. See [ARCHITECTURE.md](ARCHITECTURE.md).
   run); every other sender is silently dropped.
 - **Local only.** Sessions execute on your machine; transcripts stay on your disk. The daemon
   never uses cloud/remote-execution features. Its only outbound traffic is the Telegram Bot API,
-  the normal Claude API traffic every session makes, and (optionally) the usage endpoint.
+  the normal Claude API traffic every session makes, and (optionally) the usage endpoint. The
+  voice features add two more destinations, each contacted only while you use it: a voice note's
+  audio goes to **Google** through your own local `gemini` CLI to be transcribed, and with voice
+  replies enabled the spoken text goes to **Microsoft's** keyless Edge read-aloud endpoint.
 - **Secrets in the Keychain**, never in files or the repo. Runtime state lives in
   `~/.claude/bridge-state/` and is git-ignored.
 - **Not end-to-end encrypted.** Telegram bot chats traverse Telegram's servers. Do not route
-  sensitive/confidential data through the bot.
+  sensitive/confidential data through the bot — including by dictating it into a voice note.
 
 ## Setup
 
@@ -130,6 +133,15 @@ defaults apply when a key is absent — add a key only to override it:
 |---|---|---|
 | `usageWarnPct` | `90` | Warn in Telegram when the 5-hour usage window crosses this percentage. |
 | `approvalTimeoutMin` | `15` | Auto-deny a managed permission/plan/question prompt left unanswered for this many minutes — a fail-safe so a never-tapped prompt can't hang the session. |
+| `richMessages` | `false` | Send replies containing tables or headings as Telegram Rich Messages (native tables), falling back to HTML. Clients too old for them show "update your Telegram" instead of the content, so it is opt-in. |
+| `claudeExecutable` | *(unset)* | Absolute path to a `claude` binary for spawned sessions. Unset uses the SDK's bundled CLI, which is version-paired with the SDK — the recommended default. |
+| `voice.googleCloudProject` | *(unset)* | `GOOGLE_CLOUD_PROJECT` for the `gemini` CLI. Required in practice: without a project the CLI's individual tier now refuses to run. |
+| `voice.uvxPath` | `uvx` | How to run `edge-tts` (via [uv](https://docs.astral.sh/uv/)). Use an absolute path — launchd's `PATH` normally does not include it. |
+| `voice.replies` | `auto` | `off` · `auto` (speak only when you sent a voice note) · `always`. |
+| `voice.sttModel` | `gemini-2.5-pro` | Transcription model. Do not use a `flash` model for Persian — quality drops sharply. |
+| `voice.faVoice` / `voice.enVoice` | `fa-IR-DilaraNeural` / `en-US-AriaNeural` | Edge TTS voices, picked per reply by script detection. |
+| `voice.sttMaxDurationSec` / `voice.sttMaxBytes` | `300` / `19 MB` | Limits on an incoming note (Telegram itself caps bot downloads at 20 MB). |
+| `voice.ttsMaxChars` | `2500` | How much of a reply gets spoken (code blocks and tables are skipped). |
 
 `ownerId`, `chatId`, `accounts`, and `activeAccount` in the same file are managed by the daemon during
 pairing and normal use — you don't normally edit those by hand.
@@ -157,9 +169,12 @@ daemon, and use the fresh code.
 | `/groups` `/group <name>` | Organize sessions into your own groups |
 | `/copy` `/stop` `/kill` | Resend last output · interrupt · terminate |
 | `/foreign on [min]` `off` | Away-mode: relay host prompts to your phone (see below) |
+| `/voice off` `auto` `always` | Spoken replies (`auto` = only for turns you started by voice) |
 
 Inside a session topic, plain text is sent to that session; photos are sent as image input.
-Permission prompts, plan approvals, and questions appear as inline-button messages.
+A 🎙 voice note (or an audio file) is transcribed and sent as if you had typed it — Persian and
+English both work, including mixed sentences. Permission prompts, plan approvals, and questions
+appear as inline-button messages.
 
 ## Away-mode (opt-in)
 
@@ -181,6 +196,16 @@ session into the bot with `/sessions → Close & continue here`.
   on-disk transcript/sidecar formats, and hook contracts. These can change between Claude Code
   versions; parsers are written to fail soft, but features may need updates after upgrades.
 - Programmatic/agent-SDK sessions draw from your normal usage limits — watch the `/usage` panel.
+- **Voice needs two external tools on the host**: the [`gemini` CLI](https://github.com/google-gemini/gemini-cli)
+  (logged in, with `voice.googleCloudProject` set) for transcription, plus `ffmpeg` and `uvx` for
+  spoken replies. Transcription takes roughly 20–60 s per note. Edge TTS is an unofficial endpoint:
+  when it breaks, voice replies latch off for the rest of the run and text is unaffected.
+- **`/usage` and expired accounts**: an account that has been idle for days is *logged out*, not
+  merely stale — the CLI reports "Not logged in" and the 🔄 renew button cannot help. Use 🔁
+  Re-sign in (`/login`). Renewal only works while a token is recent enough for the CLI to refresh it.
+- The `/model` menu lists CLI aliases (`opus`, `sonnet`, …) plus the live catalog. Aliases track new
+  releases automatically; the catalog comes from the SDK's bundled CLI, so a new model can require
+  bumping `@anthropic-ai/claude-agent-sdk`.
 
 ## License
 

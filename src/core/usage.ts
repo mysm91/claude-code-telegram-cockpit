@@ -3,11 +3,13 @@
 //   2. Statusline snapshots dumped by statusline/collector.py (covers desktop/terminal
 //      sessions too — only if the statusLine is registered in ~/.claude/settings.json).
 //   3. The undocumented OAuth usage endpoint (per-account token from the Keychain).
+import type { Options } from "@anthropic-ai/claude-agent-sdk";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { HOME, STATE_DIR, keychain, type AccountCfg } from "../config.js";
+import { HOME, STATE_DIR, keychain, type AccountCfg, type BridgeConfig } from "../config.js";
+import { sdkQuery } from "./sdk.js";
 import type { RateInfo } from "./sessionManager.js";
 
 // The usage endpoint wants a claude-code User-Agent. Read the installed CLI's version once
@@ -23,9 +25,16 @@ function claudeVersion(): string {
 }
 
 export interface WindowUsage { pct?: number; resetsAt?: number; source: string; at: number }
-/** needsReauth = the account's access token is present but the API rejected it (401); it must be
- *  re-logged-in on the Mac. We never auto-refresh (that would rotate the CLI's own refresh token). */
-export interface AccountUsage { fiveHour?: WindowUsage; sevenDay?: WindowUsage; needsReauth?: boolean }
+/** needsReauth = the account's access token is present but the API rejected it (401). We never
+ *  auto-refresh (that would rotate the CLI's own refresh token) — see the warm-up note below. */
+export interface AccountUsage {
+  fiveHour?: WindowUsage;
+  sevenDay?: WindowUsage;
+  sevenDayOpus?: WindowUsage;
+  /** Pay-as-you-go credits beyond the subscription windows (API only, no live/statusline source). */
+  extraUsage?: { enabled: boolean; monthlyLimit?: number; usedCredits?: number; utilization?: number };
+  needsReauth?: boolean;
+}
 
 const streamCache = new Map<string, AccountUsage>(); // account -> latest from rate_limit_events
 
@@ -33,6 +42,7 @@ export function noteRateEvent(info: RateInfo): void {
   const u = streamCache.get(info.account) ?? {};
   const w: WindowUsage = { pct: info.utilization, resetsAt: info.resetsAt, source: "live", at: info.at };
   if (info.rateLimitType === "five_hour") u.fiveHour = w;
+  else if (info.rateLimitType?.startsWith("seven_day_opus")) u.sevenDayOpus = w;
   else if (info.rateLimitType?.startsWith("seven_day")) u.sevenDay = w;
   streamCache.set(info.account, u);
 }
@@ -84,6 +94,12 @@ export function accountConnected(a: AccountCfg): boolean {
 // out globally (the whole account, everywhere). For an idle account whose access token has expired we
 // report `needsReauth` and let the user re-login on the Mac. The ACTIVE account's token is kept fresh
 // by the CLI itself during normal use, so its usage numbers keep working.
+//
+// That stance is why an idle bridge account went dark: nothing ran under its CLAUDE_CONFIG_DIR, so
+// nothing refreshed it. The fix keeps the stance intact — instead of touching the token endpoint we
+// run ONE tiny turn THROUGH the CLI (warmupAccount below), let the CLI refresh and persist its own
+// credential the way it does in normal use, and then just re-read the Keychain. The bridge never
+// sees, sends, or stores a refresh token.
 
 async function oauthUsage(a: AccountCfg, attempt = 0): Promise<AccountUsage> {
   const out: AccountUsage = {};
@@ -107,18 +123,49 @@ async function oauthUsage(a: AccountCfg, attempt = 0): Promise<AccountUsage> {
       return oauthUsage(a, attempt + 1);
     }
     // Stale/expired token. We do NOT refresh (that would rotate the CLI's own refresh token and log
-    // it out) — surface `needsReauth` so the user can re-login on the Mac.
-    if (res.status === 401) return { needsReauth: true };
-    if (!res.ok) return out;
-    const d = (await res.json()) as Record<string, { utilization?: number; resets_at?: string }>;
-    const now = Date.now();
-    const conv = (w?: { utilization?: number; resets_at?: string }): WindowUsage | undefined =>
-      w && w.utilization !== undefined
-        ? { pct: w.utilization, resetsAt: w.resets_at ? Date.parse(w.resets_at) / 1000 : undefined, source: "api", at: now }
-        : undefined;
-    out.fiveHour = conv(d.five_hour);
-    out.sevenDay = conv(d.seven_day);
-  } catch { /* endpoint unreachable / token stale */ }
+    // it out) — surface `needsReauth` so the user can re-login on the Mac (or warm the account up).
+    if (res.status === 401) {
+      console.log(`usage: ${a.name} — access token rejected (401); a warm-up ping can renew it via the CLI`);
+      return { needsReauth: true };
+    }
+    if (!res.ok) {
+      console.log(`usage: ${a.name} — usage endpoint returned HTTP ${res.status}`);
+      return out;
+    }
+    return parseUsagePayload(await res.json(), Date.now());
+  } catch (e) {
+    console.log(`usage: fetch failed for ${a.name}: ${e instanceof Error ? e.message : String(e)}`);
+  }
+  return out;
+}
+
+/** The usage endpoint's payload → AccountUsage. Undocumented API, so every field is optional and
+ *  anything unexpected simply yields `undefined` instead of throwing. */
+export function parseUsagePayload(d: unknown, now: number): AccountUsage {
+  const out: AccountUsage = {};
+  const src = d && typeof d === "object" ? (d as Record<string, unknown>) : {};
+  const obj = (v: unknown): Record<string, unknown> | undefined =>
+    v && typeof v === "object" ? (v as Record<string, unknown>) : undefined;
+  const num = (v: unknown): number | undefined => (typeof v === "number" && Number.isFinite(v) ? v : undefined);
+  const conv = (v: unknown): WindowUsage | undefined => {
+    const w = obj(v);
+    const pct = num(w?.utilization);
+    if (pct === undefined) return undefined;
+    const reset = typeof w!.resets_at === "string" ? Date.parse(w!.resets_at as string) : NaN;
+    return { pct, resetsAt: Number.isNaN(reset) ? undefined : reset / 1000, source: "api", at: now };
+  };
+  out.fiveHour = conv(src.five_hour);
+  out.sevenDay = conv(src.seven_day);
+  out.sevenDayOpus = conv(src.seven_day_opus);
+  const extra = obj(src.extra_usage);
+  if (extra) {
+    out.extraUsage = {
+      enabled: Boolean(extra.is_enabled),
+      monthlyLimit: num(extra.monthly_limit),
+      usedCredits: num(extra.used_credits),
+      utilization: num(extra.utilization),
+    };
+  }
   return out;
 }
 
@@ -151,12 +198,16 @@ export async function accountUsage(a: AccountCfg): Promise<AccountUsage> {
     return !x ? y : !y ? x : x.at >= y.at ? x : y;
   };
   const freshEnough = (w?: WindowUsage): boolean => Boolean(unexpired(w) && Date.now() - w!.at < 10 * 60_000);
-  let merged: AccountUsage = { fiveHour: pick(live.fiveHour, snap.fiveHour), sevenDay: pick(live.sevenDay, snap.sevenDay) };
+  let merged: AccountUsage = {
+    fiveHour: pick(live.fiveHour, snap.fiveHour),
+    sevenDay: pick(live.sevenDay, snap.sevenDay),
+    sevenDayOpus: pick(live.sevenDayOpus, snap.sevenDayOpus),
+  };
   let needsReauth = false;
   if (!freshEnough(merged.fiveHour) || !freshEnough(merged.sevenDay)) {
     if (Date.now() >= (nextPoll.get(a.name) ?? 0)) {
       const api = await oauthUsage(a);
-      if (api.fiveHour || api.sevenDay) {
+      if (api.fiveHour || api.sevenDay || api.sevenDayOpus) {
         apiCache.set(a.name, api); persistCache();
         nextPoll.set(a.name, Date.now() + 180_000);       // success: respect the ~180s poll floor
       } else if (api.needsReauth) {
@@ -168,10 +219,114 @@ export async function accountUsage(a: AccountCfg): Promise<AccountUsage> {
     }
   }
   const cached = apiCache.get(a.name) ?? {};
-  merged = { fiveHour: pick(merged.fiveHour, cached.fiveHour), sevenDay: pick(merged.sevenDay, cached.sevenDay) };
+  merged = {
+    fiveHour: pick(merged.fiveHour, cached.fiveHour),
+    sevenDay: pick(merged.sevenDay, cached.sevenDay),
+    sevenDayOpus: pick(merged.sevenDayOpus, cached.sevenDayOpus),
+    // Credits have no window to expire and no live/statusline source: whatever the last good API
+    // poll said is the only reading there is.
+    extraUsage: cached.extraUsage,
+  };
   // Only surface "reauth needed" when we have nothing else to show (cached numbers win if present).
-  if (needsReauth && !merged.fiveHour && !merged.sevenDay) merged.needsReauth = true;
+  if (needsReauth && !merged.fiveHour && !merged.sevenDay && !merged.sevenDayOpus) merged.needsReauth = true;
   return merged;
+}
+
+const WARMUP_FILE = path.join(STATE_DIR, "warmup-state.json");
+const WARMUP_AUTO_MS = 6 * 60 * 60_000;
+const WARMUP_MANUAL_MS = 10 * 60_000;
+
+let warmupState: Record<string, number> | null = null;  // account -> last attempt (ms)
+let warmupPersist = true;
+
+function warmups(): Record<string, number> {
+  if (warmupState) return warmupState;
+  const out: Record<string, number> = {};
+  try {
+    const d = JSON.parse(fs.readFileSync(WARMUP_FILE, "utf8"));
+    if (d && typeof d === "object") for (const [k, v] of Object.entries(d)) if (typeof v === "number") out[k] = v;
+  } catch { /* first run or corrupt: an empty throttle just means the next ping is allowed */ }
+  warmupState = out;
+  return out;
+}
+
+/** Test-only: drive the throttle in memory (and stop it writing to the real bridge-state dir);
+ *  pass null to go back to the on-disk file. */
+export function __setWarmupStateForTests(m: Record<string, number> | null): void {
+  warmupState = m ? { ...m } : null;
+  warmupPersist = !m;
+}
+
+/** Stamp an attempt. Called BEFORE the ping is spawned, so a hung ping can never loop. */
+export function markWarmupAttempt(account: string, now = Date.now()): void {
+  warmups()[account] = now;
+  if (!warmupPersist) return;
+  try {
+    fs.mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
+    const tmp = WARMUP_FILE + ".tmp";
+    fs.writeFileSync(tmp, JSON.stringify(warmupState));
+    fs.renameSync(tmp, WARMUP_FILE);
+  } catch { /* best-effort: the in-memory stamp still throttles this daemon run */ }
+}
+
+/** A ping costs one haiku turn, so: automatic pings at most every 6 h, taps every 10 min. */
+export function shouldWarmup(account: string, opts?: { manual?: boolean; now?: number }): boolean {
+  const now = opts?.now ?? Date.now();
+  const last = warmups()[account] ?? 0;
+  return now - last >= (opts?.manual ? WARMUP_MANUAL_MS : WARMUP_AUTO_MS);
+}
+
+/** One-turn haiku ping under the account's CLAUDE_CONFIG_DIR: the CLI refreshes and persists its
+ *  own credential, then accountUsage() re-reads the Keychain and gets real numbers again.
+ *  `persistSession: false` (sdk.d.ts: "Sessions will not be saved to ~/.claude/projects/") is what
+ *  keeps the ping out of /sessions — it touches no Store, no SessionRec, no cockpit state. */
+export async function warmupAccount(a: AccountCfg, cfg: BridgeConfig): Promise<{ ok: boolean; error?: string }> {
+  markWarmupAttempt(a.name);
+  console.log(`usage: warm-up ping for ${a.name} (one haiku turn through the CLI)`);
+  const env: Record<string, string> = {};
+  for (const [k, v] of Object.entries(process.env)) if (v !== undefined) env[k] = v;
+  if (a.configDir) env.CLAUDE_CONFIG_DIR = a.configDir;
+  env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "1";
+  const abortController = new AbortController();
+  const deadline = setTimeout(() => abortController.abort(), 90_000);
+  const opts: Options = {
+    model: "haiku",
+    maxTurns: 1,
+    persistSession: false,
+    permissionMode: "default",
+    cwd: STATE_DIR,
+    env,
+    abortController,
+  };
+  if (cfg.claudeExecutable) opts.pathToClaudeCodeExecutable = cfg.claudeExecutable;
+  const fail = (error: string): { ok: boolean; error?: string } => {
+    console.log(`usage: warm-up ping for ${a.name} failed: ${error}`);
+    return { ok: false, error };
+  };
+  try {
+    for await (const m of sdkQuery()({ prompt: "Reply with exactly: pong", options: opts })) {
+      const t = (m as { type?: string }).type;
+      if (t === "auth_status") {
+        const err = (m as { error?: string }).error;
+        if (err) return fail(err.slice(0, 200));
+      } else if (t === "result") {
+        // The CLI puts the human reason in `result` ("Not logged in · Please run /login"), while
+        // `subtype` can still read "success" — so the subtype alone is a useless error message.
+        const r = m as { is_error?: boolean; subtype?: string; result?: string };
+        if (r.is_error) return fail((r.result || `turn failed (${r.subtype ?? "error"})`).slice(0, 200));
+        // The 401 backoff exists so we don't hammer a dead token; the token just changed.
+        nextPoll.delete(a.name);
+        console.log(`usage: warm-up ping for ${a.name} ok`);
+        return { ok: true };
+      }
+    }
+    return fail("the ping ended without a result");
+  } catch (e) {
+    return fail((e instanceof Error ? e.message : String(e)).slice(0, 200));
+  } finally {
+    clearTimeout(deadline);
+    abortController.abort();
+  }
 }
 
 /** Context % of an arbitrary session straight from its transcript (fallback for

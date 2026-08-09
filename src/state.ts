@@ -9,7 +9,12 @@ export interface SessionRec {
   topicId?: number;         // forum topic thread id (absent in flat mode)
   cwd: string;
   account: string;
+  /** What the USER chose: a full model id, an alias ("opus"), or undefined for the CLI default.
+   *  Never overwritten by what the CLI resolved — that goes to `resolvedModel`, so a session
+   *  on the default keeps following the default as new models ship. */
   model?: string;
+  /** Full model id the CLI actually resolved for this session (display only). */
+  resolvedModel?: string;
   mode: string;
   effort?: string;
   title?: string;

@@ -13,10 +13,16 @@ export function makeFakeApi() {
     sent: () => calls.filter((c) => c.method === "sendMessage"),
     edits: () => calls.filter((c) => c.method === "editMessageText"),
     texts: () => calls.filter((c) => c.method === "sendMessage").map((c) => c.args.text),
+    voices: () => calls.filter((c) => c.method === "sendVoice"),
+    riches: () => calls.filter((c) => c.method === "sendRichMessage"),
     async sendMessage(chatId, text, extra) { rec("sendMessage", { chatId, text, extra }); return { message_id: ++mid }; },
     async editMessageText(chatId, msgId, text, extra) { rec("editMessageText", { chatId, msgId, text, extra }); return { message_id: msgId }; },
     async createForumTopic(chatId, name) { rec("createForumTopic", { chatId, name }); return { message_thread_id: ++mid }; },
-    async deleteMessage() {},
+    async sendVoice(chatId, file, extra) { rec("sendVoice", { chatId, file, extra }); return { message_id: ++mid }; },
+    async sendPhoto(chatId, file, extra) { rec("sendPhoto", { chatId, file, extra }); return { message_id: ++mid }; },
+    async sendDocument(chatId, file, extra) { rec("sendDocument", { chatId, file, extra }); return { message_id: ++mid }; },
+    async sendRichMessage(chatId, rich, extra) { rec("sendRichMessage", { chatId, rich, extra }); return { message_id: ++mid }; },
+    async deleteMessage(chatId, msgId) { rec("deleteMessage", { chatId, msgId }); },
     async answerCallbackQuery() {},
   };
 }
@@ -95,6 +101,7 @@ export function installFakeQuery() {
         async applyFlagSettings() {},
         async accountInfo() { return null; },
         async supportedModels() { return []; },
+        async initializationResult() { return { models: [] }; },
       },
     };
     instances.push(inst);

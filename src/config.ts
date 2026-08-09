@@ -30,6 +30,34 @@ export interface BridgeConfig {
    *  minutes — a fail-safe so a never-tapped prompt (or a failed Telegram send) can't hang the
    *  session forever. Tunable via bridge-state/config.json; default 15. */
   approvalTimeoutMin?: number;
+  /** Try Telegram's Rich Messages (native tables/headings, Bot API 10.1) for replies that
+   *  contain them, falling back to HTML. Old clients show "update your Telegram" instead of
+   *  the content, so this is opt-in per install. */
+  richMessages?: boolean;
+  /** Absolute path to a `claude` executable for spawned sessions. Unset = the SDK's bundled
+   *  CLI (recommended: SDK and CLI are version-paired). Advanced escape hatch only. */
+  claudeExecutable?: string;
+  /** Voice notes in (transcribed via the local gemini CLI) and spoken replies out (edge-tts).
+   *  Both talk to third parties — see README's egress list. All fields optional; defaults
+   *  live in core/voice.ts resolveVoice() (loadConfig's spread is shallow, so nested
+   *  defaults here would be clobbered by a partial `voice` object in config.json). */
+  voice?: {
+    /** GOOGLE_CLOUD_PROJECT for the gemini CLI. Unset = let the CLI resolve it itself. */
+    googleCloudProject?: string;
+    sttModel?: string;
+    sttMaxDurationSec?: number;
+    sttMaxBytes?: number;
+    sttTimeoutMs?: number;
+    /** off = never speak · auto = only reply by voice to a voice prompt · always = every reply. */
+    replies?: "off" | "auto" | "always";
+    /** How to run edge-tts (it is not a bridge dependency). Default "uvx" — set an absolute
+     *  path when uvx is not on the daemon's launchd PATH. */
+    uvxPath?: string;
+    faVoice?: string;
+    enVoice?: string;
+    ttsMaxChars?: number;
+    ttsTimeoutMs?: number;
+  };
 }
 
 export const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url))); // project root (dist/..); fileURLToPath decodes %20/unicode so paths with spaces work
@@ -66,7 +94,9 @@ export function keychain(service: string, account?: string): string | null {
   try {
     const args = ["find-generic-password", "-s", service, "-w"];
     if (account) args.splice(3, 0, "-a", account);
-    return execFileSync("/usr/bin/security", args, { encoding: "utf8" }).trim() || null;
+    // stderr discarded: a missing item is normal (an account that was never logged in), and the
+    // child's stderr is inherited straight into the log file, bypassing installRedactedConsole().
+    return execFileSync("/usr/bin/security", args, { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim() || null;
   } catch {
     return null;
   }

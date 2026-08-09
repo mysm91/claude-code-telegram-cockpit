@@ -8,8 +8,9 @@ import { confinedFile, configDirOf } from "../core/inventory.js";
 import { ManagedSession, type PendingApproval, type RateInfo } from "../core/sessionManager.js";
 import { watchTranscript, type WatchHandle } from "../core/observer.js";
 import { accountUsage, noteRateEvent } from "../core/usage.js";
+import { resolveVoice, speechText, synthesizeFn } from "../core/voice.js";
 import type { SessionRec, Store } from "../state.js";
-import { chunk, esc, fmtReset, fmtTokens, mdToHtml, toolLine } from "./render.js";
+import { chunk, esc, fmtReset, fmtTokens, htmlToPlain, mdToChunks, mdToHtml, toolLine } from "./render.js";
 
 const EDIT_MIN_MS = 1600;
 const TOOL_FLUSH_MS = 2000;
@@ -31,6 +32,9 @@ export class Cockpit {
   private toolBuf = new Map<string, string[]>();
   private writtenFiles = new Map<string, string[]>(); // key -> file_paths a session wrote this turn
   private warned5h = new Set<string>();
+  private richFails = 0;
+  private richDead = false;   // latched off after repeated rich-message rejections
+  private ttsFails = 0;
 
   constructor(api: Api, cfg: BridgeConfig, store: Store) {
     this.api = api;
@@ -80,7 +84,7 @@ export class Cockpit {
       this.foreignApprovals.set(id, { tool, cwd, input, resolve: (v) => { clearTimeout(timer); this.foreignApprovals.delete(id); resolve(v); } });
       const away = "<i>You're away from the Mac, so this came to your phone. No answer in ~2 min → it waits on the Mac.</i>";
       if (tool === "ExitPlanMode") {
-        const plan = mdToHtml(String(input.plan ?? "(empty plan)")).slice(0, 3200);
+        const plan = mdToHtml(String(input.plan ?? "(empty plan)").slice(0, 3000));
         const kb = new InlineKeyboard()
           .text("✅ Approve", `fp:${id}:pa`).text("❌ Reject", `fp:${id}:px`).row()
           .text("✏️ Revise (send feedback)", `fp:${id}:pv`);
@@ -119,7 +123,7 @@ export class Cockpit {
         lastId = m.message_id;
       } catch {
         try {
-          const m = await this.api.sendMessage(chatId, pieces[i].replace(/<[^>]+>/g, ""), { ...extra, ...kb, ...quiet });
+          const m = await this.api.sendMessage(chatId, htmlToPlain(pieces[i]), { ...extra, ...kb, ...quiet });
           lastId = m.message_id;
         } catch { /* give up on this piece */ }
       }
@@ -155,7 +159,7 @@ export class Cockpit {
       onRateLimit: (s, info) => void this.renderRate(s, info),
       onNote: (s, note) => void this.say(s.rec, note),
       onExit: (s, reason) => void this.onExit(s, reason),
-    });
+    }, this.cfg.claudeExecutable);
     this.live.set(rec.key, sess);
     this.store.sessions.set(rec.key, rec);
     this.store.flushSessions();
@@ -172,8 +176,15 @@ export class Cockpit {
     d.text = text;
     if (final) {
       if (d.timer) { clearTimeout(d.timer); d.timer = undefined; }
-      const html = mdToHtml(text);
-      const pieces = chunk(html);
+      // Rich messages render tables/headings natively, but the API has no "edit into rich"
+      // path, so the streaming draft is replaced (send rich, then drop the draft) rather than
+      // edited. Any failure falls through to the HTML path below with the draft still intact.
+      if (await this.trySendRich(s.rec, text)) {
+        if (d.msgId) await this.api.deleteMessage(chatId, d.msgId).catch(() => undefined);
+        this.drafts.delete(key);
+        return;
+      }
+      const pieces = mdToChunks(text);
       if (d.msgId) {
         try { await this.api.editMessageText(chatId, d.msgId, pieces[0], { parse_mode: "HTML" }); }
         catch { /* content identical or too old — fine */ }
@@ -189,15 +200,59 @@ export class Cockpit {
       const preview = d.text.length > 3600 ? "…" + d.text.slice(-3600) : d.text;
       try {
         if (!d.msgId) {
-          const m = await this.api.sendMessage(chatId, esc(preview) + " ▌", { ...this.threadOpts(s.rec) });
+          const m = await this.api.sendMessage(chatId, esc(preview) + " ▌", { parse_mode: "HTML", ...this.threadOpts(s.rec) });
           d.msgId = m.message_id;
         } else {
-          await this.api.editMessageText(chatId, d.msgId, esc(preview) + " ▌");
+          await this.api.editMessageText(chatId, d.msgId, esc(preview) + " ▌", { parse_mode: "HTML" });
         }
       } catch { /* edit races are fine */ }
     };
     if (Date.now() - d.lastEdit >= EDIT_MIN_MS && !d.timer) void flush();
     else if (!d.timer) d.timer = setTimeout(() => { d.timer = undefined; void flush(); }, EDIT_MIN_MS);
+  }
+
+  /** Send an answer as a Telegram Rich Message (Bot API 10.1) so tables and headings render
+   *  natively. Opt-in via config: clients too old for rich messages show "update your Telegram"
+   *  instead of the content. Returns false when the caller should use the HTML path instead. */
+  private async trySendRich(rec: SessionRec, md: string): Promise<boolean> {
+    if (!this.cfg.richMessages || this.richDead || !this.cfg.chatId) return false;
+    if (md.length > 30_000 || !/(^#{1,6}\s|^\|.+\|)/m.test(md)) return false;
+    try {
+      await this.api.sendRichMessage(this.cfg.chatId, { markdown: md }, { ...this.threadOpts(rec) });
+      this.richFails = 0;
+      return true;
+    } catch (e) {
+      if (++this.richFails >= 2) {
+        this.richDead = true;
+        console.log("rich messages: 2 consecutive failures, falling back to HTML until restart");
+      }
+      console.log(`rich message rejected: ${e instanceof Error ? e.message : e}`);
+      return false;
+    }
+  }
+
+  /** Speak a finished answer as a voice note. Purely additive — the text reply is already sent,
+   *  so every failure here is swallowed (edge-tts is an unofficial endpoint and does break). */
+  private async maybeVoiceReply(s: ManagedSession): Promise<void> {
+    const vs = resolveVoice(this.cfg);
+    if (vs.replies === "off" || this.ttsFails >= 3 || !this.cfg.chatId) return;
+    if (vs.replies === "auto" && !s.lastPromptWasVoice) return;
+    const { text, truncated } = speechText(s.lastFinalText, vs.ttsMaxChars);
+    if (!text) return;
+    const r = await synthesizeFn()(text, vs);
+    if (!r.ok) {
+      console.log(`voice reply failed: ${r.error}`);
+      if (++this.ttsFails >= 3)
+        await this.say(s.rec, "<i>🔇 Voice replies keep failing — off until the daemon restarts (text is unaffected).</i>", undefined, { silent: true });
+      return;
+    }
+    this.ttsFails = 0;
+    await this.api.sendVoice(this.cfg.chatId, new InputFile(r.ogg, "reply.ogg"), {
+      ...this.threadOpts(s.rec),
+      ...(r.durationSec ? { duration: Math.round(r.durationSec) } : {}),
+      ...(truncated ? { caption: "🔊 spoken reply is shortened — full text above" } : {}),
+      disable_notification: true,
+    });
   }
 
   private renderTool(s: ManagedSession, name: string, input: Record<string, unknown>): void {
@@ -324,6 +379,8 @@ export class Cockpit {
     }
     await this.say(s.rec, `<i>${lines.join("\n")}</i>`, kb);
     await this.flushWrittenFiles(s.rec);
+    // Once per turn (onText fires per assistant message, which would speak several times).
+    try { await this.maybeVoiceReply(s); } catch (e) { console.log(`voice reply skipped: ${e instanceof Error ? e.message : e}`); }
   }
 
   /** After a turn, auto-send the files the session wrote (so you SEE its outputs) — images as
@@ -341,7 +398,7 @@ export class Cockpit {
       if (sent >= MAX_AUTO) { await this.say(rec, `<i>…and ${files.length - sent} more file(s) written — <code>/file &lt;path&gt;</code> to fetch.</i>`); break; }
       const res = confinedFile(rec.cwd, path.relative(rec.cwd, fp), 10 * 1024 * 1024);
       if ("error" in res) continue; // outside cwd / secret / too big / already gone → skip
-      const caption = `📄 ${esc(path.basename(res.real))}`;
+      const caption = `📄 ${path.basename(res.real)}`; // captions are sent without parse_mode
       try {
         if (res.isImage) await this.api.sendPhoto(this.cfg.chatId, new InputFile(res.real), { caption, ...extra });
         else await this.api.sendDocument(this.cfg.chatId, new InputFile(res.real), { caption, ...extra });

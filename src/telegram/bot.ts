@@ -7,15 +7,17 @@ import { createHash, randomBytes } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { promisify } from "node:util";
-import { BridgeConfig, saveConfig, STATE_DIR } from "../config.js";
+import { BridgeConfig, saveConfig, STATE_DIR, type AccountCfg } from "../config.js";
 import { addToGroup, desktopGroupNames, removeFromGroup } from "../core/groups.js";
 import { confinedFile, configDirOf, listLocalSessions, listPlans, listRoutines, sessionCwd, sessionMeta, sessionTail, sessionTasks, type LocalSession } from "../core/inventory.js";
 import { disableForeign, enableForeign, ensureForeignState, foreignState } from "../core/foreignPerms.js";
 import { startPermServer } from "../core/permServer.js";
-import { accountConnected, accountUsage, transcriptContextPct } from "../core/usage.js";
+import { accountConnected, accountUsage, shouldWarmup, transcriptContextPct, warmupAccount } from "../core/usage.js";
+import { buildModelMenu, bundledCliVersion, catalogKey, loadCatalog, saveCatalog, sdkVersion } from "../core/modelCatalog.js";
+import { audioExt, resolveVoice, transcribe } from "../core/voice.js";
 import type { SessionRec, Store } from "../state.js";
 import { Cockpit } from "./cockpit.js";
-import { chunk, esc, fmtAgo, fmtPct, fmtReset, fmtTokens, mdToHtml } from "./render.js";
+import { chunk, esc, fmtAgo, fmtPct, fmtReset, fmtTokens, htmlToPlain, mdToHtml } from "./render.js";
 
 const execFileP = promisify(execFile);
 // Same naming as Claude Code's own mode menu ("default" is what the desktop calls "Ask permissions").
@@ -38,8 +40,6 @@ const EFFORTS: Array<{ id: string; label: string; hint: string }> = [
   { id: "low", label: "Low", hint: "fastest and lightest" },
 ];
 const effortLabel = (id?: string): string => (id ? EFFORTS.find((e) => e.id === id)?.label ?? id : "Extra (global default)");
-const modelVersion = (m: { id: string; label: string; description: string }): string =>
-  m.id === "default" ? m.label : (m.description.split("·")[0]?.trim() || m.label).replace(" with 1M context", " (1M)");
 const SESSIONS_PER_PAGE = 10;
 const shortPath = (p: string): string => p.replace(/^\/Users\//, "");
 
@@ -61,7 +61,7 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
         /can't parse entities/i.test((res as { description?: string }).description ?? "") &&
         p.parse_mode && (method === "sendMessage" || method === "editMessageText")) {
       const stripped = { ...payload, parse_mode: undefined } as typeof payload & { text?: string };
-      if (typeof p.text === "string") stripped.text = p.text.replace(/<[^>]+>/g, "");
+      if (typeof p.text === "string") stripped.text = htmlToPlain(p.text);
       return prev(method, stripped, signal);
     }
     return res;
@@ -266,7 +266,8 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
     ctx.reply(
       [
         "<b>Sessions</b>: /new [path] · /sessions · /resume &lt;id&gt; · /use (flat mode) · /stop · /kill",
-        "<b>While in a session topic</b>: just type to send input · /model · /mode · /effort · /status · /copy · /plan · /tasks · /files · /file &lt;path&gt;",
+        "<b>While in a session topic</b>: just type to send input · send a 🎙 voice note (Persian or English) · /model · /mode · /effort · /status · /copy · /plan · /tasks · /files · /file &lt;path&gt;",
+        "<b>Voice</b>: /voice off | auto | always — spoken replies (auto = only when you spoke)",
         "<b>Watch foreign sessions</b>: /sessions → 👁 Watch · /unwatch",
         "<b>Overview</b>: /usage · /routines · /plans · /groups · /group &lt;name&gt; · /ungroup &lt;name&gt; · /account",
         "<b>Permissions & plans</b> arrive as button prompts automatically.",
@@ -552,11 +553,11 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
       if (!a) return void ctx.reply(`No account named "${esc(arg)}". Known: ${cfg.accounts.map((x) => esc(x.name)).join(", ")}.`);
       return void startLogin(a);
     }
-    const disconnected = cfg.accounts.filter((a) => !accountConnected(a));
-    if (!disconnected.length) return void ctx.reply("All configured accounts are already logged in. (/usage to check.)");
+    // Every account is offered, not just the ones with no stored credential: a stored token can be
+    // expired past renewal ("Not logged in" from the CLI), and that account still needs a re-login.
     const kb = new InlineKeyboard();
-    disconnected.forEach((a) => kb.text(`🔐 Sign in ${a.name}`, `login:${putRef("login", a.name)}`).row());
-    await ctx.reply("Which account needs signing in? A browser opens on your Mac — finish there.", { reply_markup: kb });
+    cfg.accounts.forEach((a) => kb.text(`${accountConnected(a) ? "🔁 Re-sign in" : "🔐 Sign in"} ${a.name}`, `login:${putRef("login", a.name)}`).row());
+    await ctx.reply("Which account should I sign in? A browser opens on your Mac — finish there.\n(“Re-sign in” is the fix when /usage says an account's token expired.)", { reply_markup: kb });
   });
 
   bot.command("use", async (ctx) => {
@@ -607,22 +608,23 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
     const rec = recOf(ctx);
     if (!rec) return void ctx.reply("No session here.");
     const sess = cockpit.live.get(rec.key);
-    let models = sess ? await sess.models() : [];
-    if (models.length) cachedModels = models;
-    else models = cachedModels;
-    if (!models.length) return void ctx.reply("Model list not loaded yet — send one message to any session first, then retry.");
-    const isCurrent = (m: { id: string; resolved?: string }): boolean =>
-      m.id === rec.model || (!!m.resolved && m.resolved === rec.model);
+    // A live session's catalog is authoritative; persist it so the menu also works right after a
+    // daemon restart. Aliases are always offered either way, so there is no "not loaded yet" wall.
+    const live = sess ? await sess.models() : [];
+    if (live.length) saveCatalog(live, catalogKey(cfg));
+    const catalog = live.length ? live : loadCatalog().models;
+    const { rows, stalePin } = buildModelMenu(catalog, rec);
     const kb = new InlineKeyboard();
-    models.slice(0, 12).forEach((m) => {
-      kb.text(`${isCurrent(m) ? "✓ " : ""}${modelVersion(m)}`, `md:${rec.key}:${putRef("model", m.id)}`).row();
-    });
-    modelChoices.set(rec.key, models);
-    const lines = models.map((m) => `${isCurrent(m) ? "✓" : "·"} <b>${esc(m.label)}</b> — <i>${esc(m.description || m.resolved || "")}</i>`);
-    await ctx.reply(`<b>Model</b> — current: <b>${esc(rec.model ?? "Default")}</b>\n\n${lines.join("\n")}`, { parse_mode: "HTML", reply_markup: kb });
+    rows.forEach((r) => kb.text(`${r.current ? "✓ " : ""}${r.label.slice(0, 40)}`, `md:${rec.key}:${putRef("model", r.id)}`).row());
+    modelChoices.set(rec.key, rows.map((r) => ({ id: r.id, label: r.label, description: r.hint })));
+    const lines = rows.map((r) => `${r.current ? "✓" : "·"} <b>${esc(r.label)}</b>${r.hint ? ` — <i>${esc(r.hint)}</i>` : ""}`);
+    const head = `<b>Model</b> — current: <b>${esc(rec.model ?? "Default")}</b>${rec.resolvedModel && rec.resolvedModel !== rec.model ? ` <i>(running ${esc(rec.resolvedModel)})</i>` : ""}`;
+    const warn = stalePin
+      ? `\n⚠️ <code>${esc(stalePin)}</code> is pinned here but is not in the current model list — it may fail on the next turn. The alias rows (<code>opus</code>, <code>fable</code>, …) always point at the newest release.`
+      : "";
+    await replyC(ctx, `${head}${warn}\n\n${lines.join("\n")}`, { reply_markup: kb });
   });
-  const modelChoices = new Map<string, Array<{ id: string; label: string; description: string; resolved?: string }>>();
-  let cachedModels: Array<{ id: string; label: string; description: string; resolved?: string }> = [];
+  const modelChoices = new Map<string, Array<{ id: string; label: string; description: string }>>();
 
   // Full details panel — works in any topic (managed, detached, or watch sessions).
   const infoPanel = async (ctx: Context): Promise<void> => {
@@ -662,10 +664,15 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
     const weekLine = wline(u.sevenDay, "weekly");
     if (fiveLine) lines.push(fiveLine);
     if (weekLine) lines.push(weekLine);
-    if (!fiveLine && !weekLine) lines.push(u.needsReauth ? "▫️ limits n/a — reauth needed (log in again on the Mac)" : "▫️ limits n/a — run a turn on this account first");
+    if (!fiveLine && !weekLine)
+      lines.push(u.needsReauth
+        ? "▫️ limits n/a — this account's token expired; /usage has a 🔄 Refresh button"
+        : accountConnected(acct) ? "▫️ limits n/a — run a turn on this account first"
+          : "▫️ limits n/a — this account was never logged in on this Mac (/login)");
 
     lines.push("", "<b>Setup</b>");
-    lines.push(`model <code>${esc(rec.model ?? tModel ?? "default")}</code>`);
+    const running = rec.resolvedModel ?? tModel;
+    lines.push(`model <code>${esc(rec.model ?? "default")}</code>${running && running !== rec.model ? ` <i>(running ${esc(running)})</i>` : ""}`);
     lines.push(`mode <b>${modeLabel(rec.mode)}</b> · effort <b>${effortLabel(rec.effort)}</b>`);
     let acctLine = `account <b>${esc(acct.name)}</b>`;
     if (sess) {
@@ -691,6 +698,9 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
     } catch {
       lines.push("❌ Claude CLI not reachable on PATH — new sessions can't start.");
     }
+    // Sessions run the SDK's bundled CLI, not the PATH one, and the /model catalog comes from it —
+    // so an old SDK is what makes a new model invisible here.
+    lines.push(`▫️ Sessions use SDK <code>${esc(sdkVersion())}</code> (bundled CLI <code>${esc(bundledCliVersion())}</code>)${cfg.claudeExecutable ? ` · override <code>${esc(cfg.claudeExecutable)}</code>` : ""}`);
     const st = foreignState();
     lines.push(st.enabled
       ? `✅ Away-mode ON — perm server on 127.0.0.1:${st.port} (idle ≥ ${Math.round(st.idleSeconds / 60)}m)`
@@ -704,25 +714,55 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
   bot.command("health", healthPanel);
   bot.command("doctor", healthPanel);
 
-  bot.command("usage", async (ctx) => {
+  // One renderer for /usage, shared by the command and the 🔄 Refresh button. `expired` lists the
+  // accounts whose token the API just rejected, so the caller can offer/run a warm-up without
+  // polling again (a second accountUsage() call would be inside the 401 backoff and report nothing).
+  const usagePanel = async (): Promise<{ text: string; kb?: InlineKeyboard; expired: AccountCfg[] }> => {
     // Dynamic list: only accounts actually logged in right now. Log one in later and it
     // appears here; log one out / remove it and it drops off — no static roster.
     const connected = cfg.accounts.filter(accountConnected);
     const dormant = cfg.accounts.filter((a) => !accountConnected(a));
     const lines: string[] = ["<b>Usage by account</b>"];
+    const kb = new InlineKeyboard();
+    const expired: AccountCfg[] = [];
+    const wline = (w: { pct?: number; resetsAt?: number; source: string; at: number }, name: string): string =>
+      `${name} ${usageBar(w.pct)} ${fmtReset(w.resetsAt)} <i>(${w.source}, ${fmtAgo(w.at)}${Date.now() - w.at > 24 * 3600_000 ? " — stale" : ""})</i>`;
     for (const a of connected) {
       const u = await accountUsage(a);
       lines.push(`\n<b>${esc(a.name)}</b>${a.name === cfg.activeAccount ? " (active)" : ""}`);
-      if (u.fiveHour) lines.push(`5h  ${usageBar(u.fiveHour.pct)} ${fmtReset(u.fiveHour.resetsAt)} <i>(${u.fiveHour.source}, ${fmtAgo(u.fiveHour.at)})</i>`);
-      if (u.sevenDay) lines.push(`week ${usageBar(u.sevenDay.pct)} ${fmtReset(u.sevenDay.resetsAt)} <i>(${u.sevenDay.source}, ${fmtAgo(u.sevenDay.at)})</i>`);
-      if (!u.fiveHour && !u.sevenDay)
-        lines.push(u.needsReauth
-          ? "<i>n/a — reauth needed: its token has expired. Log in again on the Mac (see /account).</i>"
-          : "<i>logged in, but no reading yet — its token is idle. Use it once (/new here, or move a session to it) and it'll show.</i>");
+      if (u.fiveHour) lines.push(wline(u.fiveHour, "5h  "));
+      if (u.sevenDay) lines.push(wline(u.sevenDay, "week"));
+      if (u.sevenDayOpus) lines.push(wline(u.sevenDayOpus, "opus"));
+      if (u.extraUsage?.enabled)
+        lines.push(`⚡ extra usage ${u.extraUsage.usedCredits ?? "?"}/${u.extraUsage.monthlyLimit ?? "?"} credits${u.extraUsage.utilization !== undefined ? ` (${Math.round(u.extraUsage.utilization)}%)` : ""}`);
+      if (!u.fiveHour && !u.sevenDay) {
+        if (u.needsReauth) {
+          expired.push(a);
+          lines.push("<i>n/a — the API rejected its access token (401). 🔄 asks the Claude CLI to renew it, which works while the token is only hours old; once an account has been idle for days the CLI reports \"Not logged in\" and only 🔁 re-signing in fixes it.</i>");
+          kb.text(`🔄 Renew ${a.name}`, `uw:${putRef("acct", a.name)}`)
+            .text(`🔁 Re-sign in`, `login:${putRef("login", a.name)}`).row();
+        } else {
+          lines.push("<i>logged in, but no reading yet — its token is idle. Use it once (/new here, or move a session to it) and it'll show.</i>");
+        }
+      }
     }
     if (!connected.length) lines.push("\n<i>No accounts connected. Log one in on the Mac (see /account).</i>");
-    if (dormant.length) lines.push(`\n<i>Not connected: ${dormant.map((a) => esc(a.name)).join(", ")} — run its login on the Mac to include it.</i>`);
-    await replyC(ctx, lines.join("\n"));
+    if (dormant.length) lines.push(`\n<i>Never logged in on this Mac: ${dormant.map((a) => esc(a.name)).join(", ")} — <code>/login</code> to connect one.</i>`);
+    return { text: lines.join("\n"), kb: expired.length ? kb : undefined, expired };
+  };
+
+  bot.command("usage", async (ctx) => {
+    const { text, kb, expired } = await usagePanel();
+    await replyC(ctx, text, kb ? { reply_markup: kb } : {});
+    const toWarm = expired.filter((a) => shouldWarmup(a.name));
+    if (!toWarm.length) return;
+    await ctx.reply(`🔄 Asking the CLI to renew ${toWarm.map((a) => a.name).join(", ")}…`);
+    for (const a of toWarm) {
+      const r = await warmupAccount(a, cfg);
+      if (!r.ok) await ctx.reply(`⚠️ ${a.name}: ${r.error ?? "renewal failed"} — tap 🔁 Re-sign in (or /login ${a.name}).`);
+    }
+    const after = await usagePanel();
+    await replyC(ctx, after.text, after.kb ? { reply_markup: after.kb } : {});
   });
 
   bot.command("routines", async (ctx) => {
@@ -745,7 +785,7 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
   bot.command("plan", async (ctx) => {
     const rec = recOf(ctx);
     const sess = rec && cockpit.live.get(rec.key);
-    if (sess?.lastPlan) return void cockpit.say(rec!, `📋 <b>Current plan</b>\n\n${esc(sess.lastPlan).slice(0, 12000)}`);
+    if (sess?.lastPlan) return void cockpit.say(rec!, `📋 <b>Current plan</b>\n\n${esc(sess.lastPlan.slice(0, 12000))}`);
     await ctx.reply("No plan in this session. /plans lists saved plan files.");
   });
 
@@ -950,7 +990,7 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
           a.resolve({ behavior: "allow", updatedInput: { ...a.input, answers } });
           cockpit.approvals.delete(aid);
           qState.delete(aid);
-          await editPrompt(`💬 answered: <b>${esc(Object.values(answers).join(" · ")).slice(0, 300)}</b>`);
+          await editPrompt(`💬 answered: <b>${esc(Object.values(answers).join(" · ").slice(0, 300))}</b>`);
         };
         if (verb === "submit") {
           const answers: Record<string, string> = {};
@@ -1109,7 +1149,7 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
           s ? `cwd <code>${esc(sessionCwd(s.file) ?? s.cwd)}</code>` : "",
           s ? `account <b>${esc(s.account)}</b> · ${s.live ? `🟢 live on the Mac (pid ${s.pid})` : `⚪️ idle — last active ${fmtAgo(s.mtime)}`} · ${(s.size / 1024).toFixed(0)}KB` : "",
           t ? `context ~${fmtPct(t.pct)} · model ${esc(t.model)}` : "",
-          tail.lastAssistant ? `\n📖 <b>last reply</b>\n${mdToHtml(tail.lastAssistant).slice(0, 1200)}` : "",
+          tail.lastAssistant ? `\n📖 <b>last reply</b>\n${mdToHtml(tail.lastAssistant.slice(0, 1100))}` : "",
           s?.live ? `\n<i>Live on the Mac — I can't tell remotely whether it's mid-task or waiting on a prompt. Mirror it to watch its output, or open on the Mac: <code>open 'claude://resume?session=${esc(s.sessionId)}'</code></i>` : "",
         ].filter(Boolean).join("\n");
         await ctx.editMessageText(details, { parse_mode: "HTML", reply_markup: new InlineKeyboard().text("« Back to list", "sl:back") }).catch(() => undefined);
@@ -1214,11 +1254,14 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
       const modelId = getRef("model", ref);
       const choice = modelId ? (modelChoices.get(key)?.find((m) => m.id === modelId) ?? { id: modelId, label: modelId, description: "" }) : undefined;
       if (choice && (sess || rec2)) {
-        if (sess) await sess.setModel(choice.id);
-        else if (rec2) rec2.model = choice.id;
+        // "default" is a sentinel meaning "no override": it must CLEAR the pin, so the session
+        // follows the account/org default (and every future model bump) instead of pinning a name.
+        const pick = choice.id === "default" ? undefined : choice.id;
+        if (sess) await sess.setModel(pick);
+        else if (rec2) { if (pick) rec2.model = pick; else delete rec2.model; }
         store.flushSessions();
         const suffix = sess ? "" : " <i>(applies when the session resumes)</i>";
-        await ctx.editMessageText(`Model → <b>${esc(modelVersion(choice))}</b> ✅${suffix}`, { parse_mode: "HTML" }).catch(() => undefined);
+        await ctx.editMessageText(`Model → <b>${esc(choice.label)}</b> ✅${suffix}`, { parse_mode: "HTML" }).catch(() => undefined);
       } else await ctx.editMessageText("Expired or the session is gone — run /model again.").catch(() => undefined);
       return void done();
     }
@@ -1249,6 +1292,18 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
         await ctx.editMessageText(`New sessions will use <b>${esc(a.name)}</b> ✅`, { parse_mode: "HTML" }).catch(() => undefined);
       }
       return void done();
+    }
+    if (head === "uw") {
+      const name = getRef("acct", rest[0]);
+      const a = name ? cfg.accounts.find((x) => x.name === name) : undefined;
+      if (!a) return void done("Expired — run /usage again.");
+      if (!shouldWarmup(a.name, { manual: true })) return void done("Pinged very recently — give it a few minutes.");
+      await done("Renewing the token…");
+      const r = await warmupAccount(a, cfg);
+      const panel = await usagePanel();
+      await ctx.editMessageText(panel.text, { parse_mode: "HTML", ...(panel.kb ? { reply_markup: panel.kb } : {}) }).catch(() => undefined);
+      if (!r.ok) await cockpit.say(null, `⚠️ <b>${esc(a.name)}</b>: ${esc(r.error ?? "warm-up failed")} — <code>/login</code> to re-auth it.`);
+      return;
     }
     if (head === "login") {
       const name = getRef("login", rest[0]);
@@ -1366,6 +1421,93 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
     }
   });
 
+  // Voice notes: transcribe locally-invoked Gemini, then feed the text to the session exactly like
+  // typed input. The audio leaves the Mac (Google) — that is documented in README's egress list.
+  const voiceIn = async (
+    ctx: Context,
+    a: { fileId: string; ext: string; duration?: number; size?: number; caption?: string },
+  ): Promise<void> => {
+    const rec = recOf(ctx);
+    if (!rec) return void ctx.reply("No session here — /new or /sessions first.");
+    if (rec.kind === "watch") return void ctx.reply("This is a watch-only mirror. Fork it (/sessions → Fork) to interact.");
+    const vs = resolveVoice(cfg);
+    if (a.duration && a.duration > vs.sttMaxDurationSec)
+      return void ctx.reply(`⏱ That note is ${Math.round(a.duration / 60)} min — I transcribe up to ${Math.round(vs.sttMaxDurationSec / 60)} min. Split it or type instead.`);
+    if (a.size && a.size > vs.sttMaxBytes) return void ctx.reply("That audio is too large to fetch from Telegram.");
+    let sess = cockpit.live.get(rec.key);
+    if ((!sess || !sess.running) && rec.sessionId) {
+      await ctx.reply("💤 Session was detached — resuming…");
+      sess = await cockpit.spawn(rec, { resume: rec.sessionId });
+    }
+    if (!sess) return void ctx.reply("Session is gone. /new to start fresh.");
+    const status = await ctx.reply("🎙 Transcribing… (usually 20–60 s)");
+    const chatId = ctx.chat?.id;
+    const setStatus = async (html: string): Promise<void> => {
+      if (chatId) await ctx.api.editMessageText(chatId, status.message_id, html, { parse_mode: "HTML" }).catch(() => undefined);
+    };
+    try {
+      const f = await ctx.api.getFile(a.fileId);
+      if (f.file_size && f.file_size > vs.sttMaxBytes) return void await setStatus("That audio is too large to fetch from Telegram.");
+      const resp = await fetch(`https://api.telegram.org/file/bot${token}/${f.file_path}`, { signal: AbortSignal.timeout(30_000) });
+      if (!resp.ok) return void await setStatus(`Couldn't download the audio (HTTP ${resp.status}).`);
+      const buf = Buffer.from(await resp.arrayBuffer());
+      if (buf.length > vs.sttMaxBytes) return void await setStatus("That audio is too large.");
+      const r = await transcribe(buf, a.ext, vs);
+      if (!r.ok) return void await setStatus(`⚠️ Couldn't transcribe it (${esc(r.error)}). Send it again, or type the message.`);
+      const pieces = chunk(`🎙 ${esc(r.text)}`);
+      await setStatus(pieces[0]);
+      for (const p of pieces.slice(1)) await cockpit.say(rec, p);
+      sess.send(a.caption ? `${r.text}\n\n${a.caption}` : r.text, { fromVoice: true });
+    } catch (e) {
+      await setStatus(`⚠️ Voice failed: ${esc(e instanceof Error ? e.message : String(e))}`);
+    }
+  };
+
+  bot.on("message:voice", (ctx) => voiceIn(ctx, {
+    fileId: ctx.message.voice.file_id,
+    ext: ".ogg",
+    duration: ctx.message.voice.duration,
+    size: ctx.message.voice.file_size,
+    caption: ctx.message.caption,
+  }));
+
+  bot.on("message:audio", async (ctx) => {
+    const ext = audioExt(ctx.message.audio.file_name, ctx.message.audio.mime_type);
+    if (!ext) return void ctx.reply("I can transcribe ogg, mp3, m4a, aac, wav and flac audio (or a plain voice note).");
+    await voiceIn(ctx, {
+      fileId: ctx.message.audio.file_id,
+      ext,
+      duration: ctx.message.audio.duration,
+      size: ctx.message.audio.file_size,
+      caption: ctx.message.caption,
+    });
+  });
+
+  bot.on("message:video_note", (ctx) => void ctx.reply("🎥 Round video notes aren't supported — send a 🎙 voice message instead."));
+
+  bot.command("voice", async (ctx) => {
+    const arg = ctx.match?.trim().toLowerCase();
+    const mode = arg === "on" ? "auto" : arg === "off" || arg === "auto" || arg === "always" ? arg : null;
+    if (mode) {
+      cfg.voice = { ...cfg.voice, replies: mode };
+      saveConfig(cfg);
+      return void ctx.reply(mode === "off"
+        ? "🔇 Voice replies off. Voice notes you send are still transcribed."
+        : mode === "auto"
+          ? "🔊 Voice replies on for turns you start with a voice note."
+          : "🔊 Voice replies on for every reply.");
+    }
+    const vs = resolveVoice(cfg);
+    await ctx.reply(
+      [
+        `${vs.replies === "off" ? "⚪️ Voice replies off" : `🟢 Voice replies ${vs.replies}`} · Persian <b>${esc(vs.faVoice)}</b> · English <b>${esc(vs.enVoice)}</b>`,
+        `Transcription: <b>${esc(vs.sttModel)}</b> via the local gemini CLI, up to ${Math.round(vs.sttMaxDurationSec / 60)} min per note${vs.googleCloudProject ? "" : " <i>(no voice.googleCloudProject set — the CLI must resolve its own project)</i>"}`,
+        "<code>/voice off</code> · <code>/voice auto</code> (reply by voice when you spoke) · <code>/voice always</code>",
+      ].join("\n"),
+      { parse_mode: "HTML" },
+    );
+  });
+
   void bot.api.setMyCommands([
     { command: "new", description: "New session in a directory" },
     { command: "sessions", description: "All local sessions (resume/fork/watch)" },
@@ -1375,6 +1517,7 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
     { command: "login", description: "Sign a logged-out account back in (browser opens on the Mac)" },
     { command: "bindchat", description: "Move the cockpit to THIS chat (confirmed)" },
     { command: "model", description: "Switch model" },
+    { command: "voice", description: "Voice replies: off / auto / always" },
     { command: "mode", description: "Switch permission mode" },
     { command: "effort", description: "Switch effort level" },
     { command: "stop", description: "Interrupt the current turn" },
