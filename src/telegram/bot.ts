@@ -232,7 +232,7 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
 
   const usageBar = (pct?: number): string => {
     if (pct === undefined) return "▫️ n/a";
-    const filled = Math.round(Math.min(100, pct) / 10);
+    const filled = Math.round(Math.max(0, Math.min(100, pct)) / 10); // repeat() throws on a negative count
     return `${"▓".repeat(filled)}${"░".repeat(10 - filled)} ${Math.round(pct)}%`;
   };
 
@@ -604,6 +604,32 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
     await ctx.reply(`<b>Effort</b> (Smarter → Faster) — current: <b>${effortLabel(rec.effort)}</b>\n\n${hints}`, { parse_mode: "HTML", reply_markup: kb });
   });
 
+  // Registered with the other commands, ABOVE the message:text handler: that handler swallows
+  // every unrecognised slash command without calling next(), so a command declared after it is
+  // silently unreachable.
+  bot.command("voice", async (ctx) => {
+    const arg = ctx.match?.trim().toLowerCase();
+    const mode = arg === "on" ? "auto" : arg === "off" || arg === "auto" || arg === "always" ? arg : null;
+    if (mode) {
+      cfg.voice = { ...cfg.voice, replies: mode };
+      saveConfig(cfg);
+      return void ctx.reply(mode === "off"
+        ? "🔇 Voice replies off. Voice notes you send are still transcribed."
+        : mode === "auto"
+          ? "🔊 Voice replies on for turns you start with a voice note."
+          : "🔊 Voice replies on for every reply.");
+    }
+    const vs = resolveVoice(cfg);
+    await ctx.reply(
+      [
+        `${vs.replies === "off" ? "⚪️ Voice replies off" : `🟢 Voice replies ${vs.replies}`} · Persian <b>${esc(vs.faVoice)}</b> · English <b>${esc(vs.enVoice)}</b>`,
+        `Transcription: <b>${esc(vs.sttModel)}</b> via the local gemini CLI, up to ${Math.round(vs.sttMaxDurationSec / 60)} min per note${vs.googleCloudProject ? "" : " <i>(no voice.googleCloudProject set — the CLI must resolve its own project)</i>"}`,
+        "<code>/voice off</code> · <code>/voice auto</code> (reply by voice when you spoke) · <code>/voice always</code>",
+      ].join("\n"),
+      { parse_mode: "HTML" },
+    );
+  });
+
   bot.command("model", async (ctx) => {
     const rec = recOf(ctx);
     if (!rec) return void ctx.reply("No session here.");
@@ -757,12 +783,16 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
     const toWarm = expired.filter((a) => shouldWarmup(a.name));
     if (!toWarm.length) return;
     await ctx.reply(`🔄 Asking the CLI to renew ${toWarm.map((a) => a.name).join(", ")}…`);
-    for (const a of toWarm) {
-      const r = await warmupAccount(a, cfg);
-      if (!r.ok) await ctx.reply(`⚠️ ${a.name}: ${r.error ?? "renewal failed"} — tap 🔁 Re-sign in (or /login ${a.name}).`);
-    }
-    const after = await usagePanel();
-    await replyC(ctx, after.text, after.kb ? { reply_markup: after.kb } : {});
+    // Detached on purpose: a ping is a CLI spawn (up to its 90 s deadline) and grammY handles
+    // updates one at a time, so awaiting it here would freeze every other tap meanwhile.
+    void (async () => {
+      for (const a of toWarm) {
+        const r = await warmupAccount(a, cfg);
+        if (!r.ok) await ctx.reply(`⚠️ ${a.name}: ${r.error ?? "renewal failed"} — tap 🔁 Re-sign in (or /login ${a.name}).`).catch(() => undefined);
+      }
+      const after = await usagePanel();
+      await replyC(ctx, after.text, after.kb ? { reply_markup: after.kb } : {});
+    })();
   });
 
   bot.command("routines", async (ctx) => {
@@ -1324,20 +1354,19 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
     await done();
   });
 
-  // ---- plain messages: input routing ----
-  bot.on("message:text", async (ctx) => {
-    const text = ctx.message.text;
-    // Claude Code's own slash commands pass through to the session; other unknown
-    // /commands are dropped (registered bot commands were already consumed above).
-    if (text.startsWith("/") && !/^\/(compact|context|clear)\b/.test(text)) return;
+  // Anything the cockpit is WAITING for (a plan revision, a question's free-text answer, a
+  // directory for /new) is answered by the next message in that topic — typed or spoken, hence
+  // shared by the text and voice handlers. Returns true when the text was consumed as an answer.
+  const consumePending = async (ctx: Context, text: string): Promise<boolean> => {
     if (pendingForeignRevise) { // revision feedback for a foreign-session plan (owner-only, topic-agnostic)
       const fa = cockpit.foreignApprovals.get(pendingForeignRevise);
       pendingForeignRevise = null;
-      if (!fa) return void ctx.reply("That plan prompt expired.");
+      if (!fa) { await ctx.reply("That plan prompt expired."); return true; }
       fa.resolve({ decision: "deny", reason: `Revise the plan based on this feedback and re-present it: ${text}` });
-      return void ctx.reply("✏️ Feedback sent — the desktop session will revise the plan.");
+      await ctx.reply("✏️ Feedback sent — the desktop session will revise the plan.");
+      return true;
     }
-    const tk = `${cfg.chatId}:${ctx.message.message_thread_id ?? 0}`;
+    const tk = `${cfg.chatId}:${(ctx.message ?? ctx.callbackQuery?.message)?.message_thread_id ?? 0}`;
     const wait = awaiting.get(tk) ?? awaiting.get(threadKey(ctx));
     if (wait) {
       awaiting.delete(tk);
@@ -1346,10 +1375,10 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
         const abs = text.trim().startsWith("~") ? text.trim().replace("~", process.env.HOME ?? "") : text.trim();
         const ok = await startSession(path.resolve(abs));
         if (!ok) await ctx.reply(`Directory not found: ${abs}`);
-        return;
+        return true;
       }
       const a = cockpit.approvals.get(wait.aid);
-      if (!a) return void ctx.reply("That prompt expired.");
+      if (!a) { await ctx.reply("That prompt expired."); return true; }
       if (wait.type === "planFeedback") {
         a.resolve({ behavior: "deny", message: `Revise the plan based on this feedback: ${text}` });
         cockpit.approvals.delete(wait.aid);
@@ -1379,8 +1408,18 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
           await ctx.reply(`💬 Recorded for question ${qi + 1}${q.multiSelect ? " (added to your picks)" : ""} — tap 📨 Submit answers once every question is answered.`);
         }
       }
-      return;
+      return true;
     }
+    return false;
+  };
+
+  // ---- plain messages: input routing ----
+  bot.on("message:text", async (ctx) => {
+    const text = ctx.message.text;
+    // Claude Code's own slash commands pass through to the session; other unknown
+    // /commands are dropped (registered bot commands were already consumed above).
+    if (text.startsWith("/") && !/^\/(compact|context|clear)\b/.test(text)) return;
+    if (await consumePending(ctx, text)) return;
     const rec = recOf(ctx);
     if (!rec) return void ctx.reply("No session bound here. /new to start one, /sessions to resume, /use to pick (flat mode).");
     if (rec.kind === "watch") return void ctx.reply("This is a watch-only mirror. Fork it (/sessions → Fork) to interact.");
@@ -1457,6 +1496,9 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
       const pieces = chunk(`🎙 ${esc(r.text)}`);
       await setStatus(pieces[0]);
       for (const p of pieces.slice(1)) await cockpit.say(rec, p);
+      // A spoken answer to a pending prompt (a plan revision, a question's "Other…", a /new
+      // directory) must land there, exactly as a typed one would.
+      if (await consumePending(ctx, r.text)) return;
       sess.send(a.caption ? `${r.text}\n\n${a.caption}` : r.text, { fromVoice: true });
     } catch (e) {
       await setStatus(`⚠️ Voice failed: ${esc(e instanceof Error ? e.message : String(e))}`);
@@ -1484,29 +1526,6 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
   });
 
   bot.on("message:video_note", (ctx) => void ctx.reply("🎥 Round video notes aren't supported — send a 🎙 voice message instead."));
-
-  bot.command("voice", async (ctx) => {
-    const arg = ctx.match?.trim().toLowerCase();
-    const mode = arg === "on" ? "auto" : arg === "off" || arg === "auto" || arg === "always" ? arg : null;
-    if (mode) {
-      cfg.voice = { ...cfg.voice, replies: mode };
-      saveConfig(cfg);
-      return void ctx.reply(mode === "off"
-        ? "🔇 Voice replies off. Voice notes you send are still transcribed."
-        : mode === "auto"
-          ? "🔊 Voice replies on for turns you start with a voice note."
-          : "🔊 Voice replies on for every reply.");
-    }
-    const vs = resolveVoice(cfg);
-    await ctx.reply(
-      [
-        `${vs.replies === "off" ? "⚪️ Voice replies off" : `🟢 Voice replies ${vs.replies}`} · Persian <b>${esc(vs.faVoice)}</b> · English <b>${esc(vs.enVoice)}</b>`,
-        `Transcription: <b>${esc(vs.sttModel)}</b> via the local gemini CLI, up to ${Math.round(vs.sttMaxDurationSec / 60)} min per note${vs.googleCloudProject ? "" : " <i>(no voice.googleCloudProject set — the CLI must resolve its own project)</i>"}`,
-        "<code>/voice off</code> · <code>/voice auto</code> (reply by voice when you spoke) · <code>/voice always</code>",
-      ].join("\n"),
-      { parse_mode: "HTML" },
-    );
-  });
 
   void bot.api.setMyCommands([
     { command: "new", description: "New session in a directory" },

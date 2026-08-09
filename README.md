@@ -52,9 +52,10 @@ hook. See [ARCHITECTURE.md](ARCHITECTURE.md).
 - **Local only.** Sessions execute on your machine; transcripts stay on your disk. The daemon
   never uses cloud/remote-execution features. Its only outbound traffic is the Telegram Bot API,
   the normal Claude API traffic every session makes, and (optionally) the usage endpoint. The
-  voice features add two more destinations, each contacted only while you use it: a voice note's
-  audio goes to **Google** through your own local `gemini` CLI to be transcribed, and with voice
-  replies enabled the spoken text goes to **Microsoft's** keyless Edge read-aloud endpoint.
+  voice features add two more destinations, both triggered by sending a voice note: its audio goes
+  to **Google** through your own local `gemini` CLI to be transcribed, and — since spoken replies
+  default to on — the spoken text goes to **Microsoft's** keyless Edge read-aloud endpoint.
+  `/voice off` stops the second; sending no voice notes stops both.
 - **Secrets in the Keychain**, never in files or the repo. Runtime state lives in
   `~/.claude/bridge-state/` and is git-ignored.
 - **Not end-to-end encrypted.** Telegram bot chats traverse Telegram's servers. Do not route
@@ -137,7 +138,7 @@ defaults apply when a key is absent — add a key only to override it:
 | `claudeExecutable` | *(unset)* | Absolute path to a `claude` binary for spawned sessions. Unset uses the SDK's bundled CLI, which is version-paired with the SDK — the recommended default. |
 | `voice.googleCloudProject` | *(unset)* | `GOOGLE_CLOUD_PROJECT` for the `gemini` CLI. Required in practice: without a project the CLI's individual tier now refuses to run. |
 | `voice.uvxPath` | `uvx` | How to run `edge-tts` (via [uv](https://docs.astral.sh/uv/)). Use an absolute path — launchd's `PATH` normally does not include it. |
-| `voice.replies` | `auto` | `off` · `auto` (speak only when you sent a voice note) · `always`. |
+| `voice.replies` | `auto` | `off` · `auto` (speak only when you sent a voice note) · `always`. Note the default is **on**: your first voice note also starts the Edge-TTS egress. |
 | `voice.sttModel` | `gemini-2.5-pro` | Transcription model. Do not use a `flash` model for Persian — quality drops sharply. |
 | `voice.faVoice` / `voice.enVoice` | `fa-IR-DilaraNeural` / `en-US-AriaNeural` | Edge TTS voices, picked per reply by script detection. |
 | `voice.sttMaxDurationSec` / `voice.sttMaxBytes` | `300` / `19 MB` | Limits on an incoming note (Telegram itself caps bot downloads at 20 MB). |

@@ -56,3 +56,34 @@ test("lifecycle: a stream error detaches the session and notes it", async () => 
     fake.reset();
   }
 });
+
+// --- regressions from the 2026-08-09 adversarial review ---
+
+test("switching model clears the resolved id, and a new turn clears the last answer", async () => {
+  const fake = installFakeQuery();
+  try {
+    const api = makeFakeApi();
+    const cockpit = new Cockpit(api, makeCfg(), makeFakeStore());
+    const rec = makeRec();
+    const sess = await cockpit.spawn(rec, { firstPrompt: "hi" });
+    const inst = fake.latest();
+
+    inst.push(msg.init("s1", "claude-opus-4-8"));
+    inst.push(msg.assistantText("first answer"));
+    await tick();
+    assert.equal(rec.resolvedModel, "claude-opus-4-8");
+    assert.equal(sess.lastFinalText, "first answer");
+
+    // A mid-session switch must not keep claiming we're running the old model.
+    await sess.setModel("haiku");
+    assert.equal(rec.model, "haiku");
+    assert.equal(rec.resolvedModel, undefined, "the stale resolved id would be reported as 'running'");
+
+    // A turn that produces no text must not leave the previous answer behind: /copy and the
+    // spoken reply both read lastFinalText.
+    sess.send("and now?");
+    assert.equal(sess.lastFinalText, "", "previous answer must not survive into a new turn");
+  } finally {
+    fake.reset();
+  }
+});

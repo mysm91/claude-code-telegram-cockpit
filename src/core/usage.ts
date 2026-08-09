@@ -47,7 +47,10 @@ export function noteRateEvent(info: RateInfo): void {
   if (info.rateLimitType === "five_hour") u.fiveHour = w;
   else if (info.rateLimitType === "seven_day") u.sevenDay = w;
   else if (info.rateLimitType?.startsWith("seven_day_")) {
-    const name = info.rateLimitType.slice("seven_day_".length).replace(/_/g, " ");
+    // "seven_day_opus" → "Opus", matching the display names the API uses, so the same window
+    // doesn't change label depending on which source reported it last.
+    const raw = info.rateLimitType.slice("seven_day_".length).replace(/_/g, " ");
+    const name = raw.replace(/\b[a-z]/g, (c) => c.toUpperCase());
     u.scoped = [...(u.scoped ?? []).filter((s) => s.name.toLowerCase() !== name.toLowerCase()), { name, win: w }];
   }
   streamCache.set(info.account, u);
@@ -153,9 +156,11 @@ export function parseUsagePayload(d: unknown, now: number): AccountUsage {
   const obj = (v: unknown): Record<string, unknown> | undefined =>
     v && typeof v === "object" ? (v as Record<string, unknown>) : undefined;
   const num = (v: unknown): number | undefined => (typeof v === "number" && Number.isFinite(v) ? v : undefined);
+  // Percentages are rendered as a bar with String.repeat, which throws on a negative count.
+  const pctOf = (v: unknown): number | undefined => { const n = num(v); return n === undefined ? undefined : Math.max(0, Math.min(100, n)); };
   const conv = (v: unknown): WindowUsage | undefined => {
     const w = obj(v);
-    const pct = num(w?.utilization);
+    const pct = pctOf(w?.utilization);
     if (pct === undefined) return undefined;
     const reset = typeof w!.resets_at === "string" ? Date.parse(w!.resets_at as string) : NaN;
     return { pct, resetsAt: Number.isNaN(reset) ? undefined : reset / 1000, source: "api", at: now };
@@ -164,18 +169,18 @@ export function parseUsagePayload(d: unknown, now: number): AccountUsage {
   out.sevenDay = conv(src.seven_day);
   // Model-scoped weekly windows live in `limits[]` (kind "weekly_scoped"), carrying their own
   // display name — the parallel `seven_day_<model>` keys are null on plans that still have them.
-  const scoped: Array<{ name: string; win: WindowUsage }> = [];
+  const scoped = new Map<string, { name: string; win: WindowUsage }>();
   const limits = Array.isArray(src.limits) ? src.limits : [];
   for (const raw of limits) {
     const l = obj(raw);
     if (!l || l.kind !== "weekly_scoped") continue;
     const name = String(obj(obj(l.scope)?.model)?.display_name ?? "").trim();
-    const pct = num(l.percent);
+    const pct = pctOf(l.percent);
     if (!name || pct === undefined) continue;
     const reset = typeof l.resets_at === "string" ? Date.parse(l.resets_at) : NaN;
-    scoped.push({ name, win: { pct, resetsAt: Number.isNaN(reset) ? undefined : reset / 1000, source: "api", at: now } });
+    scoped.set(name.toLowerCase(), { name, win: { pct, resetsAt: Number.isNaN(reset) ? undefined : reset / 1000, source: "api", at: now } });
   }
-  if (scoped.length) out.scoped = scoped;
+  if (scoped.size) out.scoped = [...scoped.values()];
   const extra = obj(src.extra_usage);
   if (extra) {
     out.extraUsage = {
@@ -202,11 +207,36 @@ function persistCache(): void {
   try { fs.writeFileSync(CACHE_FILE, JSON.stringify(Object.fromEntries(apiCache))); } catch { /* best-effort */ }
 }
 
-/** A window whose reset time has already passed describes the PREVIOUS window — drop it. */
+/** How long a reading may be shown at all. A window with no resets_at (what the endpoint returns
+ *  for an untouched 5-hour window) would otherwise live forever in the cache and keep reporting
+ *  0% — which also suppressed the "token expired" state and the pool-exhausted offer. */
+const MAX_AGE_MS = 6 * 3600_000;
+
+/** A window whose reset time has passed describes the PREVIOUS window; one older than
+ *  MAX_AGE_MS describes a day nobody cares about. Either way: drop it. */
 function unexpired(w?: WindowUsage): WindowUsage | undefined {
   if (!w) return undefined;
   if (w.resetsAt && w.resetsAt * 1000 < Date.now() - 60_000) return undefined;
+  if (Date.now() - w.at > MAX_AGE_MS) return undefined;
   return w;
+}
+
+/** Merge per-model windows by name (case-insensitively), freshest wins. The live stream only ever
+ *  reports the ONE model of the current turn, so swapping whole sets would drop every other
+ *  model's window until the next successful API poll. */
+function mergeScoped(...sets: Array<Array<{ name: string; win: WindowUsage }> | undefined>): Array<{ name: string; win: WindowUsage }> | undefined {
+  const by = new Map<string, { name: string; win: WindowUsage }>();
+  for (const set of sets) {
+    for (const s of set ?? []) {
+      const win = unexpired(s.win);
+      if (!win) continue;
+      const key = s.name.toLowerCase();
+      const prev = by.get(key);
+      // Prefer the fresher reading; on a tie prefer the API's display name over a stream-derived one.
+      if (!prev || win.at > prev.win.at) by.set(key, { name: s.name, win });
+    }
+  }
+  return by.size ? [...by.values()] : undefined;
 }
 
 export async function accountUsage(a: AccountCfg): Promise<AccountUsage> {
@@ -220,7 +250,7 @@ export async function accountUsage(a: AccountCfg): Promise<AccountUsage> {
   let merged: AccountUsage = {
     fiveHour: pick(live.fiveHour, snap.fiveHour),
     sevenDay: pick(live.sevenDay, snap.sevenDay),
-    scoped: live.scoped,
+    scoped: mergeScoped(live.scoped, snap.scoped),
   };
   let needsReauth = false;
   if (!freshEnough(merged.fiveHour) || !freshEnough(merged.sevenDay)) {
@@ -241,10 +271,7 @@ export async function accountUsage(a: AccountCfg): Promise<AccountUsage> {
   merged = {
     fiveHour: pick(merged.fiveHour, cached.fiveHour),
     sevenDay: pick(merged.sevenDay, cached.sevenDay),
-    // Scoped windows arrive as a set per source, so take the fresher SET rather than merging
-    // per name (a name absent from the newer set means the plan no longer reports it).
-    scoped: (merged.scoped?.[0]?.win.at ?? 0) >= (cached.scoped?.[0]?.win.at ?? 0)
-      ? (merged.scoped ?? cached.scoped) : (cached.scoped ?? merged.scoped),
+    scoped: mergeScoped(merged.scoped, cached.scoped),
     // Credits have no window to expire and no live/statusline source: whatever the last good API
     // poll said is the only reading there is.
     extraUsage: cached.extraUsage,
@@ -323,6 +350,9 @@ export async function warmupAccount(a: AccountCfg, cfg: BridgeConfig): Promise<{
   if (cfg.claudeExecutable) opts.pathToClaudeCodeExecutable = cfg.claudeExecutable;
   const fail = (error: string): { ok: boolean; error?: string } => {
     console.log(`usage: warm-up ping for ${a.name} failed: ${error}`);
+    // Clear the 401 backoff even on failure: the caller re-renders the panel immediately, and a
+    // suppressed poll there would report "idle" instead of the expired token it should act on.
+    nextPoll.delete(a.name);
     return { ok: false, error };
   };
   try {

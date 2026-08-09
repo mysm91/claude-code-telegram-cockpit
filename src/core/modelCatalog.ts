@@ -124,8 +124,10 @@ export function toModelRows(models: unknown): ModelRow[] {
  *  the pin itself is never rewritten. */
 export function buildModelMenu(catalog: ModelRow[], rec: { model?: string; resolvedModel?: string }): { rows: MenuRow[]; stalePin?: string } {
   const pin = rec.model;
+  // "default" is the no-pin sentinel and its button CLEARS the pin, so it may only be ticked when
+  // there is no pin — otherwise the row shown as "already current" would actually change state.
   const isCurrent = (id: string, resolved?: string): boolean =>
-    pin === undefined ? id === "default" : id === pin || resolved === pin;
+    pin === undefined ? id === "default" : id !== "default" && (id === pin || resolved === pin);
   const rows: MenuRow[] = ALIAS_MODELS.map((a) => {
     const cat = catalog.find((m) => m.id === a.id || m.resolved === a.id);
     return {
@@ -141,6 +143,9 @@ export function buildModelMenu(catalog: ModelRow[], rec: { model?: string; resol
     rows.push({ id: m.id, label: m.label, hint: m.description || m.resolved || "", current: isCurrent(m.id, m.resolved), alias: false });
   }
   const stale = pin !== undefined && !aliasIds.has(pin) && !catalog.some((m) => m.id === pin || m.resolved === pin);
+  // Always offer the pinned model back, even when the catalog doesn't list it: otherwise the one
+  // model the session is actually on is the one thing the menu can't re-select.
+  if (stale) rows.push({ id: pin, label: pin, hint: "pinned here, not in the current catalog", current: true, alias: false });
   return stale ? { rows, stalePin: pin } : { rows };
 }
 

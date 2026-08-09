@@ -65,7 +65,13 @@ export function hasPersian(s: string): boolean {
 /** Markdown → speakable plain text: markup, code, tables and URLs are unspeakable, so they go.
  *  Caps at maxChars on a word boundary (the caller tells the user it was cut). */
 export function speechText(md: string, maxChars: number): { text: string; truncated: boolean } {
-  const outside = md.split(/```/).filter((_, i) => i % 2 === 0).join("\n");
+  // An odd number of fences means the last one never closed (a stray ``` in prose, or a reply
+  // truncated mid-block): keep that trailing text as prose instead of dropping the rest of the
+  // answer silently.
+  const parts = md.split(/```/);
+  const keep = parts.filter((_, i) => i % 2 === 0);
+  if (parts.length % 2 === 0) keep.push(parts[parts.length - 1]); // unclosed final fence: prose, not code
+  const outside = keep.join("\n");
   const lines: string[] = [];
   for (const raw of outside.split("\n")) {
     if (/^\s*\|.*\|\s*$/.test(raw)) continue;                        // table row (incl. |---| separator)
@@ -99,9 +105,38 @@ export function parseGeminiJson(stdout: string): string | null {
   };
   const direct = attempt(stdout);
   if (direct) return direct;
-  const i = stdout.indexOf("{");
-  return i < 0 ? null : attempt(stdout.slice(i));
+  // The CLI wraps its JSON in whatever it feels like — a log line before it, a "session saved"
+  // trailer after it, or a ```json fence. Try every brace-balanced candidate, newest first, so a
+  // trailing notice or a brace-bearing preamble can't cost us a perfectly good transcript.
+  const starts: number[] = [];
+  for (let i = 0; i < stdout.length; i++) if (stdout[i] === "{") starts.push(i);
+  for (const start of starts.reverse()) {
+    let depth = 0, inStr = false, escaped = false;
+    for (let i = start; i < stdout.length; i++) {
+      const c = stdout[i];
+      if (inStr) {
+        if (escaped) escaped = false;
+        else if (c === "\\") escaped = true;
+        else if (c === '"') inStr = false;
+        continue;
+      }
+      if (c === '"') inStr = true;
+      else if (c === "{") depth++;
+      else if (c === "}" && --depth === 0) {
+        const hit = attempt(stdout.slice(start, i + 1));
+        if (hit) return hit;
+        break;
+      }
+    }
+  }
+  return null;
 }
+
+/** The CLI narrates its own failures in prose ("Error: I could not access the file…", a refusal,
+ *  a quota notice) and puts them in `.response`, where they are indistinguishable from a transcript
+ *  by shape. Sending one to the session would put words in the user's mouth, so refuse them. */
+const NOT_A_TRANSCRIPT =
+  /^(error\b|sorry\b|i (?:cannot|can't|could not|couldn't|am unable|was unable)\b|as an ai\b|unable to\b|failed to\b)/i;
 
 // Extensions the gemini CLI accepts for audio, plus .m4a/.mp4 which transcribe() remuxes first.
 const AUDIO_EXTS = new Set([".ogg", ".oga", ".mp3", ".aac", ".wav", ".flac", ".m4a", ".mp4"]);
@@ -140,6 +175,27 @@ const mkTmp = (prefix: string): string => {
   return dir;
 };
 
+/** The gemini CLI treats its cwd as a "project" and keeps a copy of the whole exchange — the
+ *  base64 audio AND the transcript — under ~/.gemini/tmp/<project>/chats/*.jsonl at mode 0644.
+ *  Deleting our own tmpdir does not touch that, so a voice note would otherwise leave the
+ *  spoken content readable on disk forever, outside the 0700 state dir. Each project dir records
+ *  the cwd it belongs to in `.project_root`, which is what we match on (the dir name itself is a
+ *  lowercased basename, so it is not a reliable key). */
+function pruneGeminiState(cwd: string): void {
+  const root = path.join(os.homedir(), ".gemini", "tmp");
+  let entries: string[] = [];
+  try { entries = fs.readdirSync(root); } catch { return; }
+  const want = cwd.toLowerCase();
+  for (const e of entries) {
+    const dir = path.join(root, e);
+    try {
+      const owner = fs.readFileSync(path.join(dir, ".project_root"), "utf8").trim().toLowerCase();
+      // realpath prefixes /private on macOS, so compare on the basename-bearing suffix too.
+      if (owner === want || owner.endsWith(want) || want.endsWith(owner)) fs.rmSync(dir, { recursive: true, force: true });
+    } catch { /* not ours, or already gone */ }
+  }
+}
+
 /** Transcribe audio through the local gemini CLI. Never throws; the tmpdir is always removed.
  *  Kept out of any session cwd so the written-files watcher can never pick these up. */
 export async function transcribe(audio: Buffer, ext: string, vs: VoiceSettings): Promise<TranscribeResult> {
@@ -168,6 +224,8 @@ export async function transcribe(audio: Buffer, ext: string, vs: VoiceSettings):
           { cwd: dir, env, timeout: vs.sttTimeoutMs, killSignal: "SIGKILL", maxBuffer: 4 * 1024 * 1024 });
         const text = parseGeminiJson(stdout);
         if (text && /^\[inaudible\]\.?$/i.test(text)) return { ok: false, error: "the audio was silent or unintelligible" };
+        if (text && (NOT_A_TRANSCRIPT.test(text) || text.includes(`@${file}`)))
+          return { ok: false, error: "the transcriber reported a problem instead of a transcript" };
         if (text) {
           console.log(`voice: transcribed in ${Math.round((Date.now() - started) / 1000)}s, ${text.length} chars`);
           return { ok: true, text };
@@ -177,6 +235,9 @@ export async function transcribe(audio: Buffer, ext: string, vs: VoiceSettings):
         const { missing, reason: r } = execError(e);
         if (missing) return { ok: false, error: "gemini CLI not found" };
         reason = `gemini ${r}`;
+        // A timeout already burned the full budget; retrying just doubles the wait before the
+        // user hears anything. Only a transient failure is worth a second attempt.
+        if (/timed out/i.test(r)) break;
       }
       console.log(`voice: transcription attempt ${attempt + 1} failed (${reason})`);
     }
@@ -184,7 +245,10 @@ export async function transcribe(audio: Buffer, ext: string, vs: VoiceSettings):
   } catch {
     return { ok: false, error: "couldn't stage the audio locally" };
   } finally {
-    if (dir) { try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* best-effort */ } }
+    if (dir) {
+      try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* best-effort */ }
+      pruneGeminiState(dir);
+    }
   }
 }
 
@@ -197,7 +261,9 @@ export async function synthesize(text: string, vs: VoiceSettings): Promise<Synth
     dir = mkTmp("tg-tts-");
     const mp3 = path.join(dir, "reply.mp3");
     const ogg = path.join(dir, "reply.ogg");
-    await execFileP(vs.uvxPath, ["edge-tts", "--voice", hasPersian(text) ? vs.faVoice : vs.enVoice, "--text", text, "--write-media", mp3],
+    // `--text=<value>`, not `--text <value>`: argparse reads a value that starts with "-" (a reply
+    // opening with a --- rule or an unspaced -bullet) as another option and exits 2.
+    await execFileP(vs.uvxPath, ["edge-tts", "--voice", hasPersian(text) ? vs.faVoice : vs.enVoice, `--text=${text}`, "--write-media", mp3],
       { timeout: vs.ttsTimeoutMs, killSignal: "SIGKILL" });
     step = "ffmpeg";
     await execFileP("ffmpeg", ["-y", "-i", mp3, "-c:a", "libopus", "-b:a", "32k", "-ar", "48000", "-ac", "1", "-application", "voip", ogg],

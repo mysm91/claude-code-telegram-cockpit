@@ -177,3 +177,25 @@ test("the throttle tests never touched the real bridge-state warmup file", () =>
   const after = fs.existsSync(WARMUP_PATH) ? fs.readFileSync(WARMUP_PATH, "utf8") : null;
   assert.equal(after, realWarmupFile);
 });
+
+// --- regressions from the 2026-08-09 adversarial review ---
+
+test("parseUsagePayload: a percentage outside 0-100 is clamped (usageBar's repeat() would throw)", () => {
+  assert.equal(parseUsagePayload({ five_hour: { utilization: -5 } }, NOW).fiveHour.pct, 0);
+  assert.equal(parseUsagePayload({ five_hour: { utilization: 140 } }, NOW).fiveHour.pct, 100);
+  const scoped = parseUsagePayload({
+    limits: [{ kind: "weekly_scoped", percent: -3, scope: { model: { display_name: "Fable" } } }],
+  }, NOW).scoped;
+  assert.equal(scoped[0].win.pct, 0);
+});
+
+test("parseUsagePayload: two limits[] entries for the same model collapse to one line", () => {
+  const u = parseUsagePayload({
+    limits: [
+      { kind: "weekly_scoped", percent: 10, scope: { model: { display_name: "Fable" } } },
+      { kind: "weekly_scoped", percent: 20, scope: { model: { display_name: "fable" } } },
+    ],
+  }, NOW);
+  assert.equal(u.scoped.length, 1, "one window per model, not one per entry");
+  assert.equal(u.scoped[0].win.pct, 20, "the later entry wins");
+});

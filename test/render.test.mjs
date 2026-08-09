@@ -108,3 +108,47 @@ test("mdToChunks: an oversized fence falls back to balanced code pieces", () => 
     assert.ok(p.length <= 532, `piece too long: ${p.length}`);
   }
 });
+
+// --- regressions from the 2026-08-09 adversarial review ---
+
+test("chunk: a link longer than the window terminates instead of looping (was an OOM hang)", () => {
+  // A ~3.8k-char URL inside bold: re-opening the <a href> cost more than the cut, so `rest`
+  // never shrank and the daemon spun until V8 killed it.
+  for (const md of [
+    "**[G](https://x.com/d/a/b?state=" + "E".repeat(3800) + ")** — open it.",
+    "## [G](https://x.com/" + "E".repeat(4000) + ")",
+    "> [G](https://x.com/" + "E".repeat(4000) + ")",
+  ]) {
+    const started = Date.now();
+    const pieces = mdToChunks(md);
+    assert.ok(Date.now() - started < 2000, "must not spin");
+    assert.ok(pieces.length >= 1);
+    for (const p of pieces) {
+      assert.ok(p.length <= 3800 + 32, `piece too long: ${p.length}`);
+      assert.ok(!/<[^>]*$/.test(p), "a piece must not end inside a tag");
+    }
+  }
+});
+
+test("chunk: never splits a surrogate pair, whatever the offset", () => {
+  const lone = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+  // The offset matters: pure emoji happens to align with the limit, "a" + emoji does not.
+  for (const src of ["😀".repeat(5000), "a" + "😀".repeat(2000), "ab" + "😀".repeat(3000)]) {
+    for (const p of chunk(src)) assert.ok(!lone.test(p), "broken pair in a piece");
+  }
+});
+
+test("mdToHtml: interleaved emphasis never yields crossing tags", () => {
+  // "<b>a <i>b</b> c</i>" is rejected outright by Telegram, which costs the whole message its
+  // formatting — such a line keeps its markers literal instead.
+  for (const md of ["~~a *b~~ c*", "**a ~~b** c~~", "_a **b_ c**", "**bold _italic** rest_"]) {
+    const html = mdToHtml(md);
+    const stack = [];
+    for (const m of html.matchAll(/<(\/?)(b|i|s|code|pre|blockquote|a)( [^>]*)?>/g)) {
+      if (m[1]) assert.equal(stack.pop(), m[2], `crossing tags for ${md}: ${html}`);
+      else stack.push(m[2]);
+    }
+    assert.equal(stack.length, 0, `unclosed tag for ${md}: ${html}`);
+  }
+  assert.equal(mdToHtml("**a** and *b*"), "<b>a</b> and <i>b</i>", "well-nested emphasis still converts");
+});

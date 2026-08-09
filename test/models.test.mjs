@@ -217,3 +217,21 @@ test("refreshCatalogIfStale: no-op on a matching key, probes and saves otherwise
   } finally { __setQueryForTests(null); }
   fs.rmSync(CACHE, { force: true });
 });
+
+// --- regressions from the 2026-08-09 adversarial review ---
+
+test("buildModelMenu: Default is never ticked while a model is pinned", () => {
+  const cat = mc.toModelRows([{ value: "claude-opus-5", displayName: "Opus 5", description: "d", resolvedModel: "claude-opus-5" }]);
+  const { rows } = mc.buildModelMenu(cat, { model: "claude-opus-5" });
+  assert.equal(rows.find((r) => r.id === "default").current, false, "Default clears the pin, so it is not the current state");
+  assert.equal(rows.filter((r) => r.current).length, 1, "exactly one row is current");
+});
+
+test("buildModelMenu: a pin the catalog does not know is still selectable", () => {
+  const cat = mc.toModelRows([{ value: "claude-opus-5", displayName: "Opus 5", description: "d" }]);
+  const { rows, stalePin } = mc.buildModelMenu(cat, { model: "claude-opus-4-8[1m]" });
+  assert.equal(stalePin, "claude-opus-4-8[1m]");
+  const own = rows.find((r) => r.id === "claude-opus-4-8[1m]");
+  assert.ok(own, "the model the session is actually on must appear in the menu");
+  assert.equal(own.current, true);
+});

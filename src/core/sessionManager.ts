@@ -270,6 +270,9 @@ export class ManagedSession {
     this.rec.status = "running";
     this.turnActive = true;
     this.lastPromptWasVoice = Boolean(opts.fromVoice);
+    // Per-turn: a turn that ends without text (interrupt, error) must not let the PREVIOUS
+    // answer be re-sent — /copy and the spoken reply both read this.
+    this.lastFinalText = "";
     this.input.push({ type: "user", message: { role: "user", content: text }, parent_tool_use_id: null });
   }
 
@@ -277,6 +280,7 @@ export class ManagedSession {
     this.rec.status = "running";
     this.turnActive = true;
     this.lastPromptWasVoice = false;
+    this.lastFinalText = "";
     const content: Array<Record<string, unknown>> = [
       { type: "image", source: { type: "base64", media_type: mediaType, data: base64 } },
     ];
@@ -297,6 +301,9 @@ export class ManagedSession {
   async setModel(model?: string): Promise<void> {
     if (model) this.rec.model = model;
     else delete this.rec.model;
+    // The old resolved id describes the model we just switched away from; the CLI reports the
+    // new one on its next init. Keeping it would make /info and /model claim we're still running it.
+    delete this.rec.resolvedModel;
     await this.q?.setModel(model);
   }
 

@@ -24,11 +24,11 @@ like any third-party chat app. **Do not route confidential, customer, or otherwi
 through it.** If you need private transport, run it over a private network (e.g. a VPN/Tailscale)
 and/or a transport you control.
 
-The optional voice features add two more third parties, each contacted only when you use it:
-sending a voice note uploads that audio to **Google** (through your own local `gemini` CLI login)
-to be transcribed, and enabling spoken replies (`/voice auto|always`) sends the spoken portion of
-Claude's reply text to **Microsoft's** keyless Edge read-aloud endpoint. Neither is contacted when
-you send no voice notes and leave `/voice off`.
+The voice features add two more third parties, both triggered by *sending a voice note*: that
+audio goes to **Google** (through your own local `gemini` CLI login) to be transcribed, and — because
+`voice.replies` defaults to **`auto`** — the spoken portion of Claude's reply text goes to
+**Microsoft's** keyless Edge read-aloud endpoint. There is no separate enabling step: the first voice
+note starts both. `/voice off` stops the Microsoft side; sending no voice notes stops both.
 
 ### Out of scope
 

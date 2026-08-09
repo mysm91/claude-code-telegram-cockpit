@@ -32,16 +32,34 @@ const QUOTE = /^ {0,3}> ?/;
 const ITEM = /^(\s*)([-*+]|\d{1,3}[.)])\s+(?:\[([ xX])\]\s+)?(.*)$/;
 // Monospace columns wider than this wrap badly on a phone → key-value fallback.
 const TABLE_COLS = 40;
+// A link whose href alone would rival a chunk cannot be carried across a split.
+const MAX_HREF = 900;
+
+/** True when every tag in the fragment closes in the order it opened. */
+const wellNested = (html: string): boolean => {
+  const stack: string[] = [];
+  for (const m of html.matchAll(TAG_RE)) {
+    const name = m[2].toLowerCase();
+    if (!TG_TAGS.has(name)) continue;
+    if (m[1]) { if (stack.pop() !== name) return false; }
+    else stack.push(name);
+  }
+  return stack.length === 0;
+};
 
 /** Emphasis on already-escaped text. Italic carries word-boundary guards so
- *  snake_case identifiers and `3*4` survive. */
-const emph = (t: string): string =>
-  t
+ *  snake_case identifiers and `3*4` survive. Interleaved markers ("**a _b** c_") would
+ *  produce crossing tags, which Telegram rejects outright — such a line keeps its markers
+ *  literal instead of costing the whole message its formatting. */
+const emph = (t: string): string => {
+  const out = t
     .replace(/\*\*([^*\n]+?)\*\*/g, "<b>$1</b>")
     .replace(/__([^_\n]+?)__/g, "<b>$1</b>")
     .replace(/~~([^~\n]+?)~~/g, "<s>$1</s>")
     .replace(/(?<![\w*])\*([^*\n]+?)\*(?![\w*])/g, "<i>$1</i>")
     .replace(/(?<![\w_])_([^_\n]+?)_(?![\w_])/g, "<i>$1</i>");
+  return wellNested(out) ? out : t;
+};
 
 /** One line of prose → HTML. Code spans and links are lifted out first so
  *  emphasis can never run inside them (a `_` in a URL used to become <i>). */
@@ -51,10 +69,13 @@ const renderInline = (raw: string): string => {
   const restore = (s: string): string =>
     s.replace(/\u0000(\d+)\u0000/g, (_m, n: string) => restore(holds[Number(n)] ?? ""));
   let t = raw.replace(/`([^`\n]+)`/g, (_m, body: string) => keep(`<code>${esc(body)}</code>`));
-  // http(s) only: any other scheme stays literal text (no javascript: links).
+  // http(s) only: any other scheme stays literal text (no javascript: links). A URL longer than
+  // MAX_HREF stays plain text too — a single tag wider than a chunk cannot be split or re-opened,
+  // and those URLs are real (Grafana/presigned links).
   t = t.replace(
     /\[([^\]\n]*)\]\((https?:\/\/[^\s)]+)\)/g,
-    (_m, label: string, url: string) => keep(`<a href="${escAttr(url)}">${emph(esc(label))}</a>`),
+    (_m, label: string, url: string) =>
+      url.length > MAX_HREF ? `${esc(label)} (${esc(url)})` : keep(`<a href="${escAttr(url)}">${emph(esc(label))}</a>`),
   );
   return restore(emph(esc(t)));
 };
@@ -238,13 +259,18 @@ const openTags = (html: string): Array<{ name: string; raw: string }> => {
   return stack;
 };
 
-/** Pull a cut back off an unclosed tag or a half-written entity. */
+/** Pull a cut back off an unclosed tag, a half-written entity, or the middle of a surrogate
+ *  pair (a cut between an emoji's two code units corrupts it on the wire). */
 const safeCut = (s: string, cut: number): number => {
   const head = s.slice(0, cut);
   const lt = head.lastIndexOf("<");
+  // lt === 0 means the tag itself is longer than the window: the caller handles that case,
+  // and pulling back to 0 here would make no progress.
   if (lt > head.lastIndexOf(">") && lt > 0) return lt;
   const amp = /&[a-zA-Z#0-9]{0,8}$/.exec(head);
   if (amp && cut - amp[0].length > 0) return cut - amp[0].length;
+  const last = s.charCodeAt(cut - 1);
+  if (last >= 0xd800 && last <= 0xdbff && cut > 1) return cut - 1;
   return cut;
 };
 
@@ -263,17 +289,22 @@ export function chunk(html: string, limit = 3800): string[] {
   while (rest.length > limit) {
     let cut = chooseCut(rest, limit);
     let open = openTags(rest.slice(0, cut));
-    const overhead = open.reduce((n, t) => n + t.name.length + 3, 0);
-    if (cut + overhead > limit && cut > overhead) {
-      cut = chooseCut(rest, cut - overhead);
+    const closeCost = open.reduce((n, t) => n + t.name.length + 3, 0);
+    if (cut + closeCost > limit && cut > closeCost) {
+      cut = chooseCut(rest, cut - closeCost);
       open = openTags(rest.slice(0, cut));
     }
+    // Re-opening costs the RAW tags (an <a href="…"> can be huge), so progress must be measured
+    // against those, not against the closing tags. If re-opening would leave `rest` no shorter,
+    // emit the piece unwrapped: losing formatting on one seam beats looping forever.
+    const reopen = open.map((t) => t.raw).join("");
+    const keepOpen = open.length > 0 && cut > reopen.length;
     let piece = rest.slice(0, cut);
-    rest = rest.slice(cut);
-    if (open.length) {
-      piece += open.map((t) => `</${t.name}>`).reverse().join("");
-      rest = open.map((t) => t.raw).join("") + rest;
-    }
+    const next = (keepOpen ? reopen : "") + rest.slice(cut);
+    // Always balance the piece; only carry the formatting forward when it fits.
+    if (open.length) piece += open.map((t) => `</${t.name}>`).reverse().join("");
+    if (next.length >= rest.length) { chunks.push(rest); return chunks; }  // no progress possible
+    rest = next;
     chunks.push(piece);
   }
   if (rest.trim()) chunks.push(rest);

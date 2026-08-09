@@ -133,3 +133,24 @@ test("audioExt: allowlisted extensions win, mime types map, anything else is nul
   assert.equal(audioExt("track.wma", "audio/x-ms-wma"), null);
   assert.equal(audioExt(undefined, undefined), null);
 });
+
+// --- regressions from the 2026-08-09 adversarial review ---
+
+test("parseGeminiJson: survives a trailer, a brace-bearing preamble and a json fence", () => {
+  const good = "the real transcript";
+  for (const stdout of [
+    `{"response":"${good}"}\nSession saved to ~/.gemini/tmp/abc\n`,
+    `DEBUG loading { settings } from ~/.gemini\n{"response":"${good}"}`,
+    "```json\n" + `{"response":"${good}"}` + "\n```",
+    `{"other":{"nested":1}}\n{"response":"${good}"}`,
+  ]) {
+    assert.equal(parseGeminiJson(stdout), good, `lost the transcript in: ${JSON.stringify(stdout.slice(0, 40))}`);
+  }
+});
+
+test("speechText: an unclosed code fence does not swallow the rest of the answer", () => {
+  const { text } = speechText("Here is the plan.\n```\ncode\nmore code", 2500);
+  assert.ok(text.includes("Here is the plan."));
+  const { text: t2 } = speechText("intro ``` stray fence mid-sentence and then real prose", 2500);
+  assert.ok(t2.includes("real prose"), "text after a stray fence must still be spoken");
+});
