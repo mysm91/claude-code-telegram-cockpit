@@ -19,14 +19,22 @@ const WARMUP_PATH = path.join(STATE_DIR, "warmup-state.json");
 const realWarmupFile = fs.existsSync(WARMUP_PATH) ? fs.readFileSync(WARMUP_PATH, "utf8") : null;
 
 const NOW = 1_754_600_000_000; // 2026-08-08T00:53:20Z
+// Shaped after a real /api/oauth/usage response (captured 2026-08-09): note that the per-model
+// window is reported ONLY through limits[] — seven_day_opus and friends came back null while
+// limits[] carried a "Fable" weekly_scoped entry.
 const FULL = {
   five_hour: { utilization: 42, resets_at: "2026-08-08T05:00:00Z" },
   seven_day: { utilization: 13.5, resets_at: "2026-08-14T00:00:00Z" },
-  seven_day_opus: { utilization: 7, resets_at: "2026-08-14T00:00:00Z" },
+  seven_day_opus: null,
   extra_usage: { is_enabled: true, monthly_limit: 100, used_credits: 12.5, utilization: 12.5 },
+  limits: [
+    { kind: "session", group: "session", percent: 42, resets_at: "2026-08-08T05:00:00Z", scope: null },
+    { kind: "weekly_all", group: "weekly", percent: 13.5, resets_at: "2026-08-14T00:00:00Z", scope: null },
+    { kind: "weekly_scoped", group: "weekly", percent: 7, resets_at: "2026-08-14T00:00:00Z", scope: { model: { id: null, display_name: "Fable" } } },
+  ],
 };
 
-test("parseUsagePayload: full payload → all four windows, ISO resets_at → epoch seconds", () => {
+test("parseUsagePayload: full payload → all windows, ISO resets_at → epoch seconds", () => {
   const u = parseUsagePayload(FULL, NOW);
   assert.deepEqual(u.fiveHour, {
     pct: 42,
@@ -35,7 +43,10 @@ test("parseUsagePayload: full payload → all four windows, ISO resets_at → ep
     at: NOW,
   });
   assert.equal(u.sevenDay.pct, 13.5);
-  assert.equal(u.sevenDayOpus.pct, 7);
+  assert.deepEqual(u.scoped, [{
+    name: "Fable",
+    win: { pct: 7, resetsAt: Date.parse("2026-08-14T00:00:00Z") / 1000, source: "api", at: NOW },
+  }], "a model-scoped weekly window must be read from limits[], not seven_day_<model>");
   assert.equal(u.sevenDay.resetsAt, Date.parse("2026-08-14T00:00:00Z") / 1000);
   assert.ok(Number.isInteger(u.fiveHour.resetsAt), "resetsAt must be seconds, not ms");
   assert.deepEqual(u.extraUsage, { enabled: true, monthlyLimit: 100, usedCredits: 12.5, utilization: 12.5 });
@@ -45,7 +56,7 @@ test("parseUsagePayload: partial payload leaves the absent windows undefined", (
   const u = parseUsagePayload({ five_hour: { utilization: 5, resets_at: "2026-08-08T05:00:00Z" } }, NOW);
   assert.equal(u.fiveHour.pct, 5);
   assert.equal(u.sevenDay, undefined);
-  assert.equal(u.sevenDayOpus, undefined);
+  assert.equal(u.scoped, undefined);
   assert.equal(u.extraUsage, undefined);
   assert.equal(u.needsReauth, undefined);
 });
@@ -72,7 +83,7 @@ test("parseUsagePayload: garbage inputs never throw and report nothing", () => {
     const u = parseUsagePayload(bad, NOW);
     assert.equal(u.fiveHour, undefined, `fiveHour for ${JSON.stringify(bad)}`);
     assert.equal(u.sevenDay, undefined);
-    assert.equal(u.sevenDayOpus, undefined);
+    assert.equal(u.scoped, undefined);
   }
   assert.equal(parseUsagePayload({ extra_usage: 5 }, NOW).extraUsage, undefined);
 });

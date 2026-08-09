@@ -30,7 +30,10 @@ export interface WindowUsage { pct?: number; resetsAt?: number; source: string; 
 export interface AccountUsage {
   fiveHour?: WindowUsage;
   sevenDay?: WindowUsage;
-  sevenDayOpus?: WindowUsage;
+  /** Per-model weekly windows, named as the endpoint names them ("Fable", "Opus", …). The
+   *  top-level `seven_day_<model>` keys are null on some plans while `limits[]` still reports
+   *  the window, so this list — not a fixed field per model — is what tracks them. */
+  scoped?: Array<{ name: string; win: WindowUsage }>;
   /** Pay-as-you-go credits beyond the subscription windows (API only, no live/statusline source). */
   extraUsage?: { enabled: boolean; monthlyLimit?: number; usedCredits?: number; utilization?: number };
   needsReauth?: boolean;
@@ -42,8 +45,11 @@ export function noteRateEvent(info: RateInfo): void {
   const u = streamCache.get(info.account) ?? {};
   const w: WindowUsage = { pct: info.utilization, resetsAt: info.resetsAt, source: "live", at: info.at };
   if (info.rateLimitType === "five_hour") u.fiveHour = w;
-  else if (info.rateLimitType?.startsWith("seven_day_opus")) u.sevenDayOpus = w;
-  else if (info.rateLimitType?.startsWith("seven_day")) u.sevenDay = w;
+  else if (info.rateLimitType === "seven_day") u.sevenDay = w;
+  else if (info.rateLimitType?.startsWith("seven_day_")) {
+    const name = info.rateLimitType.slice("seven_day_".length).replace(/_/g, " ");
+    u.scoped = [...(u.scoped ?? []).filter((s) => s.name.toLowerCase() !== name.toLowerCase()), { name, win: w }];
+  }
   streamCache.set(info.account, u);
 }
 
@@ -156,7 +162,20 @@ export function parseUsagePayload(d: unknown, now: number): AccountUsage {
   };
   out.fiveHour = conv(src.five_hour);
   out.sevenDay = conv(src.seven_day);
-  out.sevenDayOpus = conv(src.seven_day_opus);
+  // Model-scoped weekly windows live in `limits[]` (kind "weekly_scoped"), carrying their own
+  // display name — the parallel `seven_day_<model>` keys are null on plans that still have them.
+  const scoped: Array<{ name: string; win: WindowUsage }> = [];
+  const limits = Array.isArray(src.limits) ? src.limits : [];
+  for (const raw of limits) {
+    const l = obj(raw);
+    if (!l || l.kind !== "weekly_scoped") continue;
+    const name = String(obj(obj(l.scope)?.model)?.display_name ?? "").trim();
+    const pct = num(l.percent);
+    if (!name || pct === undefined) continue;
+    const reset = typeof l.resets_at === "string" ? Date.parse(l.resets_at) : NaN;
+    scoped.push({ name, win: { pct, resetsAt: Number.isNaN(reset) ? undefined : reset / 1000, source: "api", at: now } });
+  }
+  if (scoped.length) out.scoped = scoped;
   const extra = obj(src.extra_usage);
   if (extra) {
     out.extraUsage = {
@@ -201,13 +220,13 @@ export async function accountUsage(a: AccountCfg): Promise<AccountUsage> {
   let merged: AccountUsage = {
     fiveHour: pick(live.fiveHour, snap.fiveHour),
     sevenDay: pick(live.sevenDay, snap.sevenDay),
-    sevenDayOpus: pick(live.sevenDayOpus, snap.sevenDayOpus),
+    scoped: live.scoped,
   };
   let needsReauth = false;
   if (!freshEnough(merged.fiveHour) || !freshEnough(merged.sevenDay)) {
     if (Date.now() >= (nextPoll.get(a.name) ?? 0)) {
       const api = await oauthUsage(a);
-      if (api.fiveHour || api.sevenDay || api.sevenDayOpus) {
+      if (api.fiveHour || api.sevenDay || api.scoped) {
         apiCache.set(a.name, api); persistCache();
         nextPoll.set(a.name, Date.now() + 180_000);       // success: respect the ~180s poll floor
       } else if (api.needsReauth) {
@@ -222,13 +241,16 @@ export async function accountUsage(a: AccountCfg): Promise<AccountUsage> {
   merged = {
     fiveHour: pick(merged.fiveHour, cached.fiveHour),
     sevenDay: pick(merged.sevenDay, cached.sevenDay),
-    sevenDayOpus: pick(merged.sevenDayOpus, cached.sevenDayOpus),
+    // Scoped windows arrive as a set per source, so take the fresher SET rather than merging
+    // per name (a name absent from the newer set means the plan no longer reports it).
+    scoped: (merged.scoped?.[0]?.win.at ?? 0) >= (cached.scoped?.[0]?.win.at ?? 0)
+      ? (merged.scoped ?? cached.scoped) : (cached.scoped ?? merged.scoped),
     // Credits have no window to expire and no live/statusline source: whatever the last good API
     // poll said is the only reading there is.
     extraUsage: cached.extraUsage,
   };
   // Only surface "reauth needed" when we have nothing else to show (cached numbers win if present).
-  if (needsReauth && !merged.fiveHour && !merged.sevenDay && !merged.sevenDayOpus) merged.needsReauth = true;
+  if (needsReauth && !merged.fiveHour && !merged.sevenDay && !merged.scoped) merged.needsReauth = true;
   return merged;
 }
 

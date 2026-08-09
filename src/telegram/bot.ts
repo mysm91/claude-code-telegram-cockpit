@@ -732,7 +732,7 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
       lines.push(`\n<b>${esc(a.name)}</b>${a.name === cfg.activeAccount ? " (active)" : ""}`);
       if (u.fiveHour) lines.push(wline(u.fiveHour, "5h  "));
       if (u.sevenDay) lines.push(wline(u.sevenDay, "week"));
-      if (u.sevenDayOpus) lines.push(wline(u.sevenDayOpus, "opus"));
+      for (const s of u.scoped ?? []) lines.push(wline(s.win, esc(s.name.slice(0, 8))));
       if (u.extraUsage?.enabled)
         lines.push(`⚡ extra usage ${u.extraUsage.usedCredits ?? "?"}/${u.extraUsage.monthlyLimit ?? "?"} credits${u.extraUsage.utilization !== undefined ? ` (${Math.round(u.extraUsage.utilization)}%)` : ""}`);
       if (!u.fiveHour && !u.sevenDay) {
