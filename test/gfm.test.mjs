@@ -178,3 +178,54 @@ test("htmlToPlain strips tags and unescapes entities (&amp; last)", () => {
   assert.equal(htmlToPlain('<a href="https://x">t</a>'), "t");
   assert.equal(htmlToPlain("&amp;lt;"), "&lt;");
 });
+
+// --- GFM backslash escapes (deferred low, closed 2026-08-24) ---
+// The renderer neither honored nor stripped `\`, so `\*literal\*` came out with the backslashes
+// visible AND italicised. Escapes are now held out between code spans and links, which is why
+// none of the five emphasis regexes needed a lookbehind.
+const B = "\\"; // exactly one backslash — avoids miscounting in the cases below
+
+test("gfm: a backslash escape suppresses the marker and leaves the character", () => {
+  assert.equal(mdToHtml(B + "*literal" + B + "*"), "*literal*");
+  assert.equal(mdToHtml(B + "_under" + B + "_"), "_under_");
+  assert.equal(mdToHtml(B + "~" + B + "~not struck" + B + "~" + B + "~"), "~~not struck~~");
+  assert.equal(mdToHtml("5 " + B + "* 3 = 15"), "5 * 3 = 15", "the arithmetic case this exists for");
+});
+
+test("gfm: escaping does not disarm real markup", () => {
+  assert.equal(mdToHtml("**real bold**"), "<b>real bold</b>");
+  assert.equal(mdToHtml("~~really struck~~"), "<s>really struck</s>");
+  assert.equal(mdToHtml("[real](https://x.com)"), '<a href="https://x.com">real</a>');
+  // An escaped backslash is a literal backslash; the emphasis after it is real.
+  assert.equal(mdToHtml(B + B + "*bold*"), B + "<i>bold</i>");
+});
+
+test("gfm: an escape inside a code span is not an escape", () => {
+  // CommonMark treats a code span's body as literal, so the backslash must survive verbatim.
+  assert.equal(mdToHtml("`a " + B + "* b`"), "<code>a " + B + "* b</code>");
+});
+
+test("gfm: only ASCII punctuation is escapable", () => {
+  assert.equal(mdToHtml(B + "d is not punctuation"), B + "d is not punctuation");
+  assert.equal(mdToHtml("trailing " + B), "trailing " + B, "a lone trailing backslash is kept");
+});
+
+test("gfm: an escaped character is HTML-escaped exactly once", () => {
+  // The held-out value goes through esc() once. Escaping it again would ship &amp;amp; to Telegram.
+  assert.equal(mdToHtml("a " + B + "& b"), "a &amp; b");
+  assert.equal(mdToHtml(B + "<tag" + B + ">"), "&lt;tag&gt;");
+});
+
+test("gfm: an escape at line start also defuses block markers", () => {
+  // Free consequence of the block regexes anchoring at line start: the backslash keeps the marker
+  // off column 0, and the inline pass then drops the backslash.
+  assert.equal(mdToHtml(B + "# not a heading"), "# not a heading");
+  assert.equal(mdToHtml(B + "- not a list"), "- not a list");
+  assert.equal(mdToHtml(B + "> not a quote"), "&gt; not a quote");
+});
+
+test("gfm: escapes never emit a tag Telegram would reject", () => {
+  for (const md of [B + "*a" + B + "*", B + "[x" + B + "](y)", B + B + "*b*", "`" + B + "*`", B + "&" + B + "<"]) {
+    assertWhitelist(mdToHtml(md), `escape ${JSON.stringify(md)}`);
+  }
+});

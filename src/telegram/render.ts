@@ -69,6 +69,15 @@ const renderInline = (raw: string): string => {
   const restore = (s: string): string =>
     s.replace(/\u0000(\d+)\u0000/g, (_m, n: string) => restore(holds[Number(n)] ?? ""));
   let t = raw.replace(/`([^`\n]+)`/g, (_m, body: string) => keep(`<code>${esc(body)}</code>`));
+  // GFM backslash escapes: `\*literal\*` must survive as text. Held out AFTER code spans (an
+  // escape inside a code span is not an escape — the span's body is literal) and BEFORE links and
+  // emphasis, so by the time those run the escaped character is already a placeholder. That is why
+  // nothing is bolted onto the five emphasis regexes, and why `\\*bold*` — an escaped backslash
+  // followed by real emphasis — still bolds. Only ASCII punctuation is escapable in GFM, so the
+  // class is explicit: `\d` keeps its backslash rather than losing it.
+  // Known deviation: a backslash does not stop a code span from opening, because backticks are
+  // taken first above. Showing `\*` inside code is by far the commoner case in a chat.
+  t = t.replace(/\\([!-\/:-@\[-\x60{-~])/g, (_m, ch: string) => keep(esc(ch)));
   // http(s) only: any other scheme stays literal text (no javascript: links). A URL longer than
   // MAX_HREF stays plain text too — a single tag wider than a chunk cannot be split or re-opened,
   // and those URLs are real (Grafana/presigned links).
