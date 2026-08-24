@@ -290,7 +290,10 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
   });
 
   bot.command("help", (ctx) =>
-    ctx.reply(
+    // Through replyC like every other panel: the text is static today, but a future line added to
+    // this list would silently 400 the whole reply rather than wrap.
+    replyC(
+      ctx,
       [
         "<b>Sessions</b>: /new [path] · /sessions · /resume &lt;id&gt; · /use (flat mode) · /stop · /kill",
         "<b>While in a session topic</b>: just type to send input · send a 🎙 voice note (Persian or English) · /model · /mode · /effort · /status · /copy · /plan · /tasks · /files · /file &lt;path&gt;",
@@ -299,7 +302,6 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
         "<b>Overview</b>: /usage · /routines · /plans · /groups · /group &lt;name&gt; · /ungroup &lt;name&gt; · /account",
         "<b>Permissions & plans</b> arrive as button prompts automatically.",
       ].join("\n"),
-      { parse_mode: "HTML" },
     ),
   );
 
@@ -577,7 +579,8 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
     const arg = ctx.match?.trim();
     if (arg) {
       const a = cfg.accounts.find((x) => x.name === arg);
-      if (!a) return void ctx.reply(`No account named "${esc(arg)}". Known: ${cfg.accounts.map((x) => esc(x.name)).join(", ")}.`);
+      // No parse_mode here, so esc() would ship a literal "&amp;" to the user rather than "&".
+      if (!a) return void ctx.reply(`No account named "${arg}". Known: ${cfg.accounts.map((x) => x.name).join(", ")}.`);
       return void startLogin(a);
     }
     // Every account is offered, not just the ones with no stored credential: a stored token can be
@@ -852,7 +855,14 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
     const acct = cockpit.account(rec.account);
     const enc = rec.cwd.replace(/[^a-zA-Z0-9]/g, "-");
     const lines = sessionTasks(rec.sessionId, path.join(configDirOf(acct), "projects", enc));
-    await ctx.reply(lines.length ? lines.map(esc).join("\n") : "No background tasks / todos for this session.", { parse_mode: "HTML" });
+    if (!lines.length) return void await ctx.reply("No background tasks / todos for this session.");
+    // sessionTasks caps subagent metas at 10 but not bash tasks or todos, so a long-lived session
+    // can produce hundreds of lines. Cap the list, then chunk what is left — an uncapped list would
+    // otherwise arrive as a dozen separate messages.
+    const MAX_TASK_LINES = 60;
+    const shown = lines.slice(0, MAX_TASK_LINES).map(esc);
+    if (lines.length > MAX_TASK_LINES) shown.push(`<i>… and ${lines.length - MAX_TASK_LINES} more</i>`);
+    await replyC(ctx, shown.join("\n"));
   });
 
   bot.command("files", async (ctx) => {
@@ -1209,7 +1219,11 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
           tail.lastAssistant ? `\n📖 <b>last reply</b>\n${mdToHtml(tail.lastAssistant.slice(0, 1100))}` : "",
           s?.live ? `\n<i>Live on the Mac — I can't tell remotely whether it's mid-task or waiting on a prompt. Mirror it to watch its output, or open on the Mac: <code>open 'claude://resume?session=${esc(s.sessionId)}'</code></i>` : "",
         ].filter(Boolean).join("\n");
-        await ctx.editMessageText(details, { parse_mode: "HTML", reply_markup: new InlineKeyboard().text("« Back to list", "sl:back") }).catch(() => undefined);
+        // An edit is one message and cannot be chunked, so cap the RENDERED html: slicing the
+        // markdown to 1100 chars is not a bound, because esc() turns one "&" into five characters.
+        const pieces = chunk(details, 3900);
+        const shown = pieces.length > 1 ? `${pieces[0]}\n<i>… truncated</i>` : pieces[0];
+        await ctx.editMessageText(shown, { parse_mode: "HTML", reply_markup: new InlineKeyboard().text("« Back to list", "sl:back") }).catch(() => undefined);
         return;
       }
       const verbLabel = rest[1] === "r" ? "▶️ Continuing" : rest[1] === "f" ? "🔀 Forking" : rest[1] === "c" ? "🛑 Closing on the Mac & continuing" : "👁 Mirroring";
@@ -1364,7 +1378,11 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
       void (async () => {
         const r = await warmupAccount(a, cfg);
         const panel = await usagePanel();
-        await ctx.editMessageText(panel.text, { parse_mode: "HTML", ...(panel.kb ? { reply_markup: panel.kb } : {}) }).catch(() => undefined);
+        // /usage sends this same panel through replyC; editing it back in unchunked meant a long
+        // panel silently failed to update, leaving a stale reading with no sign anything happened.
+        const parts = chunk(panel.text);
+        await ctx.editMessageText(parts[0], { parse_mode: "HTML", ...(panel.kb ? { reply_markup: panel.kb } : {}) }).catch(() => undefined);
+        for (const extra of parts.slice(1)) await cockpit.say(null, extra);
         if (!r.ok) await cockpit.say(null, `⚠️ <b>${esc(a.name)}</b>: ${esc(r.error ?? "warm-up failed")} — <code>/login</code> to re-auth it.`);
       })();
       return;

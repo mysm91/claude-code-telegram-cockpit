@@ -59,3 +59,33 @@ test("the session-input handlers are detached, not awaited by grammY", () => {
   assert.ok(!/bot\.on\("message:text",\s*async/.test(src.slice(at, at + 60)),
     "message:text is awaited by grammY again — a transcription will block every other update");
 });
+
+test("every reply whose content can grow without bound goes through a chunker", () => {
+  // Telegram caps a message at 4096. These four carry content the bot does not control the size
+  // of, so an unchunked send silently 400s and the user sees nothing at all. Each was measured
+  // unbounded before being fixed; the names are here so a refactor cannot quietly undo it.
+  const unbounded = [
+    // sessionTasks caps subagent metas at 10 but not bash tasks or todos.
+    { at: 'bot.command("tasks"', needs: "replyC(", why: "a long-lived session can list hundreds of todos" },
+    // Static today, but a list that only ever grows.
+    { at: 'bot.command("help"', needs: "replyC(", why: "one more help line would tip it over" },
+    // An edit cannot be chunked, so the rendered html has to be capped instead.
+    { at: "details are informational", needs: "chunk(details", why: "esc() expands one & into five chars, so a 1100-char slice is not a bound" },
+    // /usage sends this same panel chunked; the button edited it back in whole.
+    { at: "const panel = await usagePanel();", needs: "chunk(panel.text)", why: "the renew button re-renders the /usage panel" },
+  ];
+  for (const u of unbounded) {
+    const at = src.indexOf(u.at);
+    assert.ok(at > 0, `anchor not found: ${u.at}`);
+    const body = src.slice(at, at + 1400);
+    assert.ok(body.includes(u.needs), `${u.at} no longer uses ${u.needs} — ${u.why}`);
+  }
+});
+
+test("a reply sent without parse_mode does not pre-escape its text", () => {
+  // esc() without parse_mode is worse than no escaping: the user is shown a literal "&amp;".
+  const at = src.indexOf("No account named");
+  assert.ok(at > 0, "the /login unknown-account reply must exist");
+  const line = src.slice(at - 120, at + 200);
+  assert.ok(!/esc\(arg\)/.test(line), "/login escapes into a plain-text reply, so entities render literally");
+});
