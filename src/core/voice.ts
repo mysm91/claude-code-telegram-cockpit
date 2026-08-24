@@ -267,9 +267,17 @@ export async function synthesize(text: string, vs: VoiceSettings): Promise<Synth
     dir = mkTmp("tg-tts-");
     const mp3 = path.join(dir, "reply.mp3");
     const ogg = path.join(dir, "reply.ogg");
-    // `--text=<value>`, not `--text <value>`: argparse reads a value that starts with "-" (a reply
-    // opening with a --- rule or an unspaced -bullet) as another option and exits 2.
-    await execFileP(vs.uvxPath, ["edge-tts", "--voice", hasPersian(text) ? vs.faVoice : vs.enVoice, `--text=${text}`, "--write-media", mp3],
+    // The spoken text goes in a file, NOT in argv. `--text=<value>` put up to ttsMaxChars (2500)
+    // of every reply in the process table, where any local process can read it with `ps` — and
+    // this daemon itself reads other processes' argv and forwards it to Telegram, so that is not
+    // a hypothetical. `--file` is documented as "same as --text but read from file"; the temp dir
+    // is already 0700 and is removed in the finally below.
+    // (The old form used `--text=<v>` rather than `--text <v>` because argparse reads a value
+    // starting with "-" — a reply opening with a --- rule or an unspaced -bullet — as another
+    // option and exits 2. `--file` takes a path we control, so that hazard is gone with it.)
+    const txt = path.join(dir, "reply.txt");
+    fs.writeFileSync(txt, text, { encoding: "utf8", mode: 0o600 });
+    await execFileP(vs.uvxPath, ["edge-tts", "--voice", hasPersian(text) ? vs.faVoice : vs.enVoice, "--file", txt, "--write-media", mp3],
       { timeout: vs.ttsTimeoutMs, killSignal: "SIGKILL" });
     step = "ffmpeg";
     await execFileP("ffmpeg", ["-y", "-i", mp3, "-c:a", "libopus", "-b:a", "32k", "-ar", "48000", "-ac", "1", "-application", "voip", ogg],

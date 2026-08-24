@@ -4,6 +4,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { audioExt, hasPersian, parseGeminiJson, resolveVoice, speechText } from "../dist/core/voice.js";
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 test("hasPersian: letters decide, digits do not", () => {
   assert.equal(hasPersian("سلام، حالت چطوره؟"), true);
@@ -153,4 +156,23 @@ test("speechText: an unclosed code fence does not swallow the rest of the answer
   assert.ok(text.includes("Here is the plan."));
   const { text: t2 } = speechText("intro ``` stray fence mid-sentence and then real prose", 2500);
   assert.ok(t2.includes("real prose"), "text after a stray fence must still be spoken");
+});
+
+// --- the spoken reply must not sit in the process table (2026-08-24) ---
+// `--text=<value>` put up to ttsMaxChars (2500) of every reply on the command line, readable by any
+// local process via `ps`. This daemon itself reads other processes' argv and forwards 80 chars of
+// it to Telegram, so the exposure is demonstrably reachable, not theoretical. Asserted against the
+// source because the leak IS the argv, and a fake execFile would test the fake.
+test("synthesize passes the spoken text by file, never on the command line", () => {
+  const src = fs.readFileSync(
+    path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "src", "core", "voice.ts"),
+    "utf8",
+  );
+  const at = src.indexOf("export async function synthesize");
+  assert.ok(at > 0, "synthesize must exist");
+  const body = src.slice(at, at + 2600);
+  assert.ok(!/`--text=\$\{text\}`/.test(body), "the spoken text is back on argv — any local `ps` can read it");
+  assert.ok(!/"--text"/.test(body), "--text puts the value on argv; use --file");
+  assert.ok(/"--file"/.test(body), "synthesize must hand edge-tts a file path");
+  assert.ok(/mode: 0o600/.test(body), "the text file must be 0600 — the tmpdir is 0700 but the file should not be world-readable either");
 });
