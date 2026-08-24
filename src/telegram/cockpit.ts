@@ -398,7 +398,10 @@ export class Cockpit {
       if (sent >= MAX_AUTO) { await this.say(rec, `<i>…and ${files.length - sent} more file(s) written — <code>/file &lt;path&gt;</code> to fetch.</i>`); break; }
       const res = confinedFile(rec.cwd, path.relative(rec.cwd, fp), 10 * 1024 * 1024);
       if ("error" in res) continue; // outside cwd / secret / too big / already gone → skip
-      const caption = `📄 ${path.basename(res.real)}`; // captions are sent without parse_mode
+      // Captions are sent without parse_mode, and Telegram caps them at 1024. macOS NAME_MAX
+      // keeps a basename under that already, so this is belt-and-braces rather than a live bug —
+      // but the bound comes from the filesystem, not from anything in this repo.
+      const caption = `📄 ${path.basename(res.real)}`.slice(0, 1000);
       try {
         if (res.isImage) await this.api.sendPhoto(this.cfg.chatId, new InputFile(res.real), { caption, ...extra });
         else await this.api.sendDocument(this.cfg.chatId, new InputFile(res.real), { caption, ...extra });
