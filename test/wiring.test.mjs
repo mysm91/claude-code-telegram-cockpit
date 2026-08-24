@@ -34,3 +34,28 @@ test("every command advertised in setMyCommands is actually registered", () => {
     assert.ok(src.includes(`bot.command("${name}"`), `/${name} is advertised in the menu but never registered`);
   }
 });
+
+test("every message handler that feeds a session goes through the input queue", () => {
+  // Detaching the handlers is what keeps the bot answering while a transcription runs, but it
+  // also means ordering is no longer free. A handler that forgets queueInput() can let a typed
+  // message overtake a voice note sent before it — invisible until it bites, so it is asserted.
+  for (const kind of ["text", "photo", "voice", "audio"]) {
+    const at = src.indexOf(`bot.on("message:${kind}"`);
+    assert.ok(at > 0, `the message:${kind} handler must exist`);
+    // Bound the body at the NEXT handler: a fixed-size window bleeds into the following one and
+    // passes on ITS queueInput call, which is how the first version of this test let a
+    // deliberately-bypassed voice handler through.
+    const nextAt = src.indexOf('bot.on("message:', at + 10);
+    const body = src.slice(at, nextAt > at ? nextAt : src.length);
+    assert.ok(body.includes("queueInput("), `message:${kind} does not go through queueInput — it can overtake earlier input`);
+  }
+});
+
+test("the session-input handlers are detached, not awaited by grammY", () => {
+  // If message:text goes back to `async (ctx) =>`, grammY awaits it again and one voice note
+  // freezes the whole bot for up to two minutes — no /stop, no approval taps. That regression
+  // reads as a harmless refactor, so it is pinned here.
+  const at = src.indexOf('bot.on("message:text"');
+  assert.ok(!/bot\.on\("message:text",\s*async/.test(src.slice(at, at + 60)),
+    "message:text is awaited by grammY again — a transcription will block every other update");
+});

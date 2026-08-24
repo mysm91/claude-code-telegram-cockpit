@@ -18,6 +18,7 @@ import { audioExt, resolveVoice, transcribe } from "../core/voice.js";
 import type { SessionRec, Store } from "../state.js";
 import { Cockpit } from "./cockpit.js";
 import { chunk, esc, fmtAgo, fmtPct, fmtReset, fmtTokens, htmlToPlain, mdToHtml } from "./render.js";
+import { createInputQueue } from "./inputQueue.js";
 
 const execFileP = promisify(execFile);
 // Same naming as Claude Code's own mode menu ("default" is what the desktop calls "Ask permissions").
@@ -121,6 +122,27 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
   }
 
   const threadKey = (ctx: Context): string => `${ctx.chat?.id}:${(ctx.message ?? ctx.callbackQuery?.message)?.message_thread_id ?? 0}`;
+
+  // Message handlers used to be awaited by grammY's strictly sequential update loop, which bought
+  // input ordering for free — and cost the whole bot the 20–120 s a voice transcription takes: no
+  // typed input, no /stop and no approval taps for that entire window. They are detached now, so
+  // the ordering has to be re-established explicitly instead of inherited.
+  //
+  // One FIFO chain per Telegram thread. The thread is the unit the user perceives as a
+  // conversation (in forum mode it IS the session), it resolves synchronously, and it still works
+  // when nothing is bound yet — an answer to a /new directory prompt has no session to key on.
+  // Commands and callback queries are deliberately NOT queued: staying responsive while a
+  // transcription runs is the entire point of detaching.
+  const inputs = createInputQueue();
+  const inputBusy = (ctx: Context): boolean => inputs.busy(threadKey(ctx));
+  const queueInput = (ctx: Context, job: () => Promise<void>): void => {
+    void inputs.run(threadKey(ctx), job, async (e: unknown) => {
+      // bot.catch() cannot see a detached rejection, so it is surfaced here or nowhere at all.
+      const m = e instanceof Error ? e.message : String(e);
+      console.error("queued input failed:", m);
+      await ctx.reply(`⚠️ That message failed: ${m}`).catch(() => undefined);
+    });
+  };
 
   const recOf = (ctx: Context): SessionRec | undefined => {
     const tid = (ctx.message ?? ctx.callbackQuery?.message)?.message_thread_id;
@@ -1428,25 +1450,31 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
   };
 
   // ---- plain messages: input routing ----
-  bot.on("message:text", async (ctx) => {
+  bot.on("message:text", (ctx) => {
     const text = ctx.message.text;
     // Claude Code's own slash commands pass through to the session; other unknown
-    // /commands are dropped (registered bot commands were already consumed above).
+    // /commands are dropped (registered bot commands were already consumed above). Checked
+    // before queueing so an unknown command is dropped at once rather than waiting behind a
+    // transcription only to be ignored.
     if (text.startsWith("/") && !/^\/(compact|context|clear)\b/.test(text)) return;
-    if (await consumePending(ctx, text)) return;
-    const rec = recOf(ctx);
-    if (!rec) return void ctx.reply("No session bound here. /new to start one, /sessions to resume, /use to pick (flat mode).");
-    if (rec.kind === "watch") return void ctx.reply("This is a watch-only mirror. Fork it (/sessions → Fork) to interact.");
-    let sess = cockpit.live.get(rec.key);
-    if ((!sess || !sess.running) && rec.sessionId) { // also resume a dead-but-lingering session (finding #4)
-      await ctx.reply("💤 Session was detached — resuming…");
-      sess = await cockpit.spawn(rec, { resume: rec.sessionId });
-    }
-    if (!sess) return void ctx.reply("Session is gone. /new to start fresh.");
-    sess.send(text);
+    // Queued with voice and photos, not beside them: typed text that arrives after a voice note
+    // must still reach the session after it, which is what the sequential loop used to guarantee.
+    queueInput(ctx, async () => {
+      if (await consumePending(ctx, text)) return;
+      const rec = recOf(ctx);
+      if (!rec) return void ctx.reply("No session bound here. /new to start one, /sessions to resume, /use to pick (flat mode).");
+      if (rec.kind === "watch") return void ctx.reply("This is a watch-only mirror. Fork it (/sessions → Fork) to interact.");
+      let sess = cockpit.live.get(rec.key);
+      if ((!sess || !sess.running) && rec.sessionId) { // also resume a dead-but-lingering session (finding #4)
+        await ctx.reply("💤 Session was detached — resuming…");
+        sess = await cockpit.spawn(rec, { resume: rec.sessionId });
+      }
+      if (!sess) return void ctx.reply("Session is gone. /new to start fresh.");
+      sess.send(text);
+    });
   });
 
-  bot.on("message:photo", async (ctx) => {
+  bot.on("message:photo", (ctx) => queueInput(ctx, async () => {
     const rec = recOf(ctx);
     if (!rec) return void ctx.reply("No session here — /new or /sessions first.");
     let sess = cockpit.live.get(rec.key);
@@ -1472,7 +1500,7 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
     } catch (e) {
       await ctx.reply(`Photo failed: ${e instanceof Error ? e.message : e}`);
     }
-  });
+  }));
 
   // Voice notes: transcribe locally-invoked Gemini, then feed the text to the session exactly like
   // typed input. The audio leaves the Mac (Google) — that is documented in README's egress list.
@@ -1519,24 +1547,30 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
     }
   };
 
-  bot.on("message:voice", (ctx) => voiceIn(ctx, {
-    fileId: ctx.message.voice.file_id,
-    ext: ".ogg",
-    duration: ctx.message.voice.duration,
-    size: ctx.message.voice.file_size,
-    caption: ctx.message.caption,
-  }));
+  bot.on("message:voice", (ctx) => {
+    // Say so up front: otherwise a note sent behind a running transcription sits silent for up to
+    // two minutes with no "Transcribing…" of its own, and reads as dropped.
+    if (inputBusy(ctx)) void ctx.reply("🎙 Queued — still working through the previous message.").catch(() => undefined);
+    queueInput(ctx, () => voiceIn(ctx, {
+      fileId: ctx.message.voice.file_id,
+      ext: ".ogg",
+      duration: ctx.message.voice.duration,
+      size: ctx.message.voice.file_size,
+      caption: ctx.message.caption,
+    }));
+  });
 
-  bot.on("message:audio", async (ctx) => {
+  bot.on("message:audio", (ctx) => {
     const ext = audioExt(ctx.message.audio.file_name, ctx.message.audio.mime_type);
     if (!ext) return void ctx.reply("I can transcribe ogg, mp3, m4a, aac, wav and flac audio (or a plain voice note).");
-    await voiceIn(ctx, {
+    if (inputBusy(ctx)) void ctx.reply("🎙 Queued — still working through the previous message.").catch(() => undefined);
+    queueInput(ctx, () => voiceIn(ctx, {
       fileId: ctx.message.audio.file_id,
       ext,
       duration: ctx.message.audio.duration,
       size: ctx.message.audio.file_size,
       caption: ctx.message.caption,
-    });
+    }));
   });
 
   bot.on("message:video_note", (ctx) => void ctx.reply("🎥 Round video notes aren't supported — send a 🎙 voice message instead."));
