@@ -101,6 +101,47 @@ function findTranscript(accounts: AccountCfg[], cwd: string, sid: string): { fil
   return { file: "", size: 0, mtime: 0, account: accounts[0]?.name ?? "default" };
 }
 
+/** The only six fields listLocalSessions reads out of a sidecar. We cache THESE, never the
+ *  parsed document: on this machine 5,070 sidecars are 380 MB of JSON but 0.84 MB of facts
+ *  (452x), and the daemon runs for weeks — caching documents would pin hundreds of MB. */
+interface SidecarFacts {
+  scheduled: boolean;
+  sid: string;
+  cwd: string;
+  title?: string;
+  ts: number;
+  archived: boolean;
+}
+
+const sidecarCache = new Map<string, { mtime: number; size: number; facts: SidecarFacts | null }>();
+
+/** One sidecar → its facts, memoized on (mtime, size). Re-reading all of them cost 4.8 s of
+ *  blocked event loop on every /sessions; a stat is ~2 us, so a warm call is ~11 ms of stats.
+ *  A corrupt/unreadable file caches as `null` so it is not re-read on every call either.
+ *  Exported for the regression test — not part of the module's public surface otherwise. */
+export function readSidecarFacts(full: string): SidecarFacts | null {
+  let st: fs.Stats;
+  try { st = fs.statSync(full); } catch { sidecarCache.delete(full); return null; }
+  const hit = sidecarCache.get(full);
+  if (hit && hit.mtime === st.mtimeMs && hit.size === st.size) return hit.facts;
+  let facts: SidecarFacts | null = null;
+  try {
+    const d = JSON.parse(fs.readFileSync(full, "utf8")) as Record<string, unknown>;
+    // sidecar timestamps are epoch-ms integers (not ISO strings), but tolerate both.
+    const rawTs = d.lastActivityAt ?? d.createdAt;
+    facts = {
+      scheduled: Boolean(d.scheduledTaskId),
+      sid: String(d.cliSessionId ?? d.sessionId ?? ""),
+      cwd: String(d.cwd ?? d.originCwd ?? ""),
+      title: String(d.title ?? "").trim() || undefined,
+      ts: typeof rawTs === "number" ? rawTs : Date.parse(String(rawTs ?? "")) || 0,
+      archived: Boolean(d.isArchived),
+    };
+  } catch { /* corrupt — negative-cache it */ }
+  sidecarCache.set(full, { mtime: st.mtimeMs, size: st.size, facts });
+  return facts;
+}
+
 /** THE session list, sourced from the desktop app's own session index (the local_*.json
  *  sidecars) — so it matches exactly what the user sees in the app: real titles, real cwds,
  *  the archived flag, and the same set (scheduled-task runs excluded, like the app hides them).
@@ -111,6 +152,7 @@ export async function listLocalSessions(
 ): Promise<{ sessions: LocalSession[]; total: number }> {
   const live = await liveSessions();
   const byId = new Map<string, LocalSession>();
+  const seen = new Set<string>(); // every sidecar this walk saw — the rest is evicted below
   for (const root of sidecarRoots()) {
     const base = path.join(root, "claude-code-sessions");
     let accts: string[] = [];
@@ -124,38 +166,39 @@ export async function listLocalSessions(
         try { files = fs.readdirSync(odir); } catch { continue; }
         for (const f of files) {
           if (!f.startsWith("local_") || !f.endsWith(".json")) continue;
-          let d: Record<string, unknown>;
-          try { d = JSON.parse(fs.readFileSync(path.join(odir, f), "utf8")); } catch { continue; }
-          if (d.scheduledTaskId) continue; // automated runs — the app hides these from the list
-          const sid = String(d.cliSessionId ?? d.sessionId ?? "");
-          if (!sid || byId.has(sid)) continue; // dedupe across synced instances
-          const cwd = String(d.cwd ?? d.originCwd ?? "");
-          if (!cwd) continue;
-          const t = findTranscript(accounts, cwd, sid);
-          const title = String(d.title ?? "").trim() || undefined;
-          // sidecar timestamps are epoch-ms integers (not ISO strings). Take the freshest of
-          // the sidecar time and the transcript file's mtime — so a bridge-resumed session
-          // (which writes the transcript, not the sidecar) shows accurate "last activity".
-          const rawTs = d.lastActivityAt ?? d.createdAt;
-          const sidecarTs = typeof rawTs === "number" ? rawTs : Date.parse(String(rawTs ?? "")) || 0;
-          const ts = Math.max(sidecarTs, t.mtime);
-          byId.set(sid, {
-            sessionId: sid,
+          const full = path.join(odir, f);
+          seen.add(full);
+          const d = readSidecarFacts(full);
+          if (!d) continue;
+          if (d.scheduled) continue; // automated runs — the app hides these from the list
+          if (!d.sid || byId.has(d.sid)) continue; // dedupe across synced instances
+          if (!d.cwd) continue;
+          const t = findTranscript(accounts, d.cwd, d.sid);
+          // Take the freshest of the sidecar time and the transcript file's mtime — so a
+          // bridge-resumed session (which writes the transcript, not the sidecar) shows
+          // accurate "last activity". The transcript mtime is deliberately NOT cached: it
+          // changes on every turn, which is exactly what this comparison is here to catch.
+          const ts = Math.max(d.ts, t.mtime);
+          byId.set(d.sid, {
+            sessionId: d.sid,
             account: t.account,
-            cwd, realCwd: cwd,
+            cwd: d.cwd, realCwd: d.cwd,
             projectDir: t.file ? path.dirname(t.file) : "",
             file: t.file,
             mtime: ts,
             size: t.size,
-            title,
-            live: live.has(sid),
-            pid: live.get(sid),
-            archived: Boolean(d.isArchived),
+            title: d.title,
+            live: live.has(d.sid),
+            pid: live.get(d.sid),
+            archived: d.archived,
           });
         }
       }
     }
   }
+  // Evict sidecars that no longer exist, so the cache tracks the directory rather than growing
+  // forever in a daemon that stays up for weeks.
+  if (seen.size) for (const k of sidecarCache.keys()) if (!seen.has(k)) sidecarCache.delete(k);
   const out = [...byId.values()].sort((a, b) =>
     Number(b.live ?? false) - Number(a.live ?? false) ||
     Number(a.archived ?? false) - Number(b.archived ?? false) || // active before archived
