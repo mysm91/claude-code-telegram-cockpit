@@ -235,3 +235,33 @@ test("buildModelMenu: a pin the catalog does not know is still selectable", () =
   assert.ok(own, "the model the session is actually on must appear in the menu");
   assert.equal(own.current, true);
 });
+
+// --- the false "may fail" warning (deferred low, closed 2026-08-24) ---
+// Staleness was pure set membership, so an EMPTY catalog — a failed probe, or a missing cache
+// file — marked every full model id stale and warned that the model the session is happily
+// running "may fail on the next turn".
+
+test("buildModelMenu: an empty catalog cannot make a pin stale", () => {
+  const { rows, stalePin } = mc.buildModelMenu([], { model: "claude-opus-5" });
+  assert.equal(stalePin, undefined, "no catalog is not evidence of staleness");
+  const pinned = rows.find((r) => r.id === "claude-opus-5");
+  assert.ok(pinned, "the pinned model is still offered back, or it becomes unselectable");
+  assert.equal(pinned.current, true, "and it is marked as the current one");
+  assert.match(pinned.hint, /unavailable/, `the hint says why, rather than claiming staleness: ${pinned.hint}`);
+});
+
+test("buildModelMenu: a populated catalog missing the pin still warns", () => {
+  const catalog = [{ id: "claude-sonnet-5", label: "Sonnet", description: "", resolved: "claude-sonnet-5" }];
+  const { rows, stalePin } = mc.buildModelMenu(catalog, { model: "claude-opus-4-8" });
+  assert.equal(stalePin, "claude-opus-4-8", "a real absence from a real list still warns");
+  const pinned = rows.find((r) => r.id === "claude-opus-4-8");
+  assert.ok(pinned, "and it stays selectable");
+  assert.match(pinned.hint, /not in the current catalog/, "with the staleness wording, not the unavailable one");
+});
+
+test("buildModelMenu: an empty catalog never warns about an alias either", () => {
+  for (const pin of ["opus", "sonnet", "default", undefined]) {
+    const { stalePin } = mc.buildModelMenu([], pin === undefined ? {} : { model: pin });
+    assert.equal(stalePin, undefined, `alias ${pin} must never be reported stale`);
+  }
+});

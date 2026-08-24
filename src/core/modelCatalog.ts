@@ -142,10 +142,24 @@ export function buildModelMenu(catalog: ModelRow[], rec: { model?: string; resol
   for (const m of catalog.filter((m) => !aliasIds.has(m.id)).slice(0, CATALOG_ROWS)) {
     rows.push({ id: m.id, label: m.label, hint: m.description || m.resolved || "", current: isCurrent(m.id, m.resolved), alias: false });
   }
-  const stale = pin !== undefined && !aliasIds.has(pin) && !catalog.some((m) => m.id === pin || m.resolved === pin);
+  // An EMPTY catalog is not evidence that a pin is stale — it means the probe failed or the cache
+  // is missing, in which case every full model id looks unknown and every one of them gets warned
+  // about. Membership can only answer the question when there is a list to be absent from.
+  const stale = catalog.length > 0 && pin !== undefined && !aliasIds.has(pin)
+    && !catalog.some((m) => m.id === pin || m.resolved === pin);
   // Always offer the pinned model back, even when the catalog doesn't list it: otherwise the one
   // model the session is actually on is the one thing the menu can't re-select.
-  if (stale) rows.push({ id: pin, label: pin, hint: "pinned here, not in the current catalog", current: true, alias: false });
+  const unlisted = pin !== undefined && !aliasIds.has(pin) && !catalog.some((m) => m.id === pin || m.resolved === pin);
+  if (unlisted && pin !== undefined) {
+    rows.push({
+      id: pin,
+      label: pin,
+      // Two different situations, and conflating them is what produced the false warning.
+      hint: catalog.length ? "pinned here, not in the current catalog" : "pinned here (model list unavailable)",
+      current: true,
+      alias: false,
+    });
+  }
   return stale ? { rows, stalePin: pin } : { rows };
 }
 

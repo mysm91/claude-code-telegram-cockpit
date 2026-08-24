@@ -675,9 +675,13 @@ export function createBot(token: string, cfg: BridgeConfig, store: Store): { bot
     modelChoices.set(rec.key, rows.map((r) => ({ id: r.id, label: r.label, description: r.hint })));
     const lines = rows.map((r) => `${r.current ? "✓" : "·"} <b>${esc(r.label)}</b>${r.hint ? ` — <i>${esc(r.hint)}</i>` : ""}`);
     const head = `<b>Model</b> — current: <b>${esc(rec.model ?? "Default")}</b>${rec.resolvedModel && rec.resolvedModel !== rec.model ? ` <i>(running ${esc(rec.resolvedModel)})</i>` : ""}`;
+    // Three states, and the old code collapsed two of them: a pin genuinely absent from a catalog
+    // we HAVE is worth warning about; a pin we cannot judge because the catalog is empty is not.
     const warn = stalePin
       ? `\n⚠️ <code>${esc(stalePin)}</code> is pinned here but is not in the current model list — it may fail on the next turn. The alias rows (<code>opus</code>, <code>fable</code>, …) always point at the newest release.`
-      : "";
+      : catalog.length === 0
+        ? "\n<i>The model list couldn't be read just now, so only the aliases are listed. They always point at the newest release.</i>"
+        : "";
     await replyC(ctx, `${head}${warn}\n\n${lines.join("\n")}`, { reply_markup: kb });
   });
   const modelChoices = new Map<string, Array<{ id: string; label: string; description: string }>>();
